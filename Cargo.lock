@@ -254,8 +254,6 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 [[package]]
 name = "anyrender"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e2c6900aa6fa601379c17b824d0882c5c4ffd2f974124b273ba083b64f76077"
 dependencies = [
  "kurbo 0.12.0",
  "peniko",
@@ -283,17 +281,15 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "peniko",
- "pixels_window_renderer",
+ "pixels_window_renderer 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "raw-window-handle",
  "skia-safe",
- "softbuffer_window_renderer",
+ "softbuffer_window_renderer 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "anyrender_svg"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40554c3b19e6298c6210d21902796cb02f4dd1a472f393bb94a067c2c9562bc"
 dependencies = [
  "anyrender",
  "image",
@@ -306,8 +302,6 @@ dependencies = [
 [[package]]
 name = "anyrender_vello"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dd9574a872584fa9c7be06ed8be1c4875aeae37e74a567597125f3ec4579bd3"
 dependencies = [
  "anyrender",
  "debug_timer 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -323,23 +317,19 @@ dependencies = [
 [[package]]
 name = "anyrender_vello_cpu"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53ab47fd3c17dd144010b079f07e106b9d5d982c2916dcf73e8ad2f611d5becd"
 dependencies = [
  "anyrender",
  "debug_timer 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "kurbo 0.12.0",
  "peniko",
- "pixels_window_renderer",
- "softbuffer_window_renderer",
+ "pixels_window_renderer 0.1.0",
+ "softbuffer_window_renderer 0.1.0",
  "vello_cpu",
 ]
 
 [[package]]
 name = "anyrender_vello_hybrid"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c13cf51aff99a8caf04f187d2e63844f2f0f71f9eb875fa2f0548bfc199377da"
 dependencies = [
  "anyrender",
  "debug_timer 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -5178,6 +5168,15 @@ dependencies = [
 [[package]]
 name = "pixels_window_renderer"
 version = "0.1.0"
+dependencies = [
+ "anyrender",
+ "debug_timer 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pixels",
+]
+
+[[package]]
+name = "pixels_window_renderer"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5973b55d585de980b6a1db68b116c8c741c18ab5a5699621aee7cac343aea58"
 dependencies = [
@@ -6314,6 +6313,15 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
  "x11rb",
+]
+
+[[package]]
+name = "softbuffer_window_renderer"
+version = "0.1.0"
+dependencies = [
+ "anyrender",
+ "debug_timer 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "softbuffer",
 ]
 
 [[package]]
@@ -8133,8 +8141,6 @@ dependencies = [
 [[package]]
 name = "wgpu_context"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0f49e6f733fcc61e41a5ecdb36910baa5148497036784bca319289bfdca6141"
 dependencies = [
  "futures-intrusive",
  "wgpu 26.0.1",
