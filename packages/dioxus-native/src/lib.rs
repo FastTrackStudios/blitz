@@ -54,8 +54,16 @@ pub use android_activity::AndroidApp;
     )
 ))]
 pub use {
-    anyrender_vello::{CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHandle},
-    dioxus_renderer::{use_wgpu, Features, Limits},
+    anyrender_vello::{
+        CustomPaintCtx, CustomPaintSource, DeviceHandle, TextureHandle,
+        // Post-processing support
+        PostProcessor, PostProcessContext, PostProcessorChain, FullScreenQuad,
+        // Example post-processors
+        InvertPostProcessor, BoxBlurPostProcessor, GrayscalePostProcessor,
+        // Re-export wgpu for custom post-processors
+        wgpu,
+    },
+    dioxus_renderer::{use_wgpu, use_post_processor, Features, Limits},
 };
 
 use blitz_shell::{create_default_event_loop, BlitzShellEvent, Config, WindowConfig};

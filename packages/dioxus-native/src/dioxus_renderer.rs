@@ -56,6 +56,50 @@ pub fn use_wgpu<T: CustomPaintSource>(create_source: impl FnOnce() -> T) -> u64 
     id
 }
 
+/// Hook to add a post-processor to the rendering pipeline.
+///
+/// Post-processors are applied after the main scene render but before
+/// presentation to the screen. The post-processor is automatically removed
+/// when the component is unmounted.
+///
+/// # Example
+///
+/// ```ignore
+/// use dioxus_native::{use_post_processor, BoxBlurPostProcessor};
+///
+/// fn MyComponent() -> Element {
+///     // Add a blur effect to the entire window
+///     use_post_processor(|| BoxBlurPostProcessor::new(1.0));
+///
+///     rsx! { div { "Content with blur effect" } }
+/// }
+/// ```
+#[cfg(any(
+    feature = "vello",
+    all(
+        not(feature = "alt-renderer"),
+        not(all(target_os = "ios", target_abi = "sim"))
+    )
+))]
+pub fn use_post_processor<T: anyrender_vello::PostProcessor>(create_processor: impl FnOnce() -> T) {
+    use dioxus_core::{consume_context, use_hook_with_cleanup};
+
+    use_hook_with_cleanup(
+        || {
+            let renderer = consume_context::<DioxusNativeWindowRenderer>();
+            let processor = Box::new(create_processor());
+            renderer.add_post_processor(processor);
+            renderer
+        },
+        |renderer| {
+            // Note: Currently we can't remove individual post-processors,
+            // so clearing all is the only option. This means only one component
+            // should use post-processors, or they should all be added together.
+            renderer.clear_post_processors();
+        },
+    );
+}
+
 #[derive(Clone)]
 pub struct DioxusNativeWindowRenderer {
     inner: Rc<RefCell<InnerRenderer>>,
@@ -110,6 +154,25 @@ impl DioxusNativeWindowRenderer {
 
     pub fn unregister_custom_paint_source(&self, id: u64) {
         self.inner.borrow_mut().unregister_custom_paint_source(id)
+    }
+
+    /// Add a post-processor to the rendering pipeline.
+    ///
+    /// Post-processors are applied after the main scene render but before
+    /// presentation to the screen. Multiple post-processors are applied in
+    /// the order they are added.
+    pub fn add_post_processor(&self, processor: Box<dyn anyrender_vello::PostProcessor>) {
+        self.inner.borrow_mut().add_post_processor(processor)
+    }
+
+    /// Clear all post-processors from the rendering pipeline.
+    pub fn clear_post_processors(&self) {
+        self.inner.borrow_mut().clear_post_processors()
+    }
+
+    /// Returns true if there are any active post-processors.
+    pub fn has_post_processors(&self) -> bool {
+        self.inner.borrow().has_post_processors()
     }
 }
 
