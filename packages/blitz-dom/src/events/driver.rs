@@ -1,6 +1,26 @@
-use crate::Document;
+use crate::{BaseDocument, Document};
 use blitz_traits::events::{BlitzMouseButtonEvent, DomEvent, DomEventData, EventState, UiEvent};
 use std::collections::VecDeque;
+
+/// Find the first element in the document tree that has a `data-dioxus-id`
+/// attribute, indicating it's managed by Dioxus and can receive events.
+fn find_first_dioxus_element(doc: &BaseDocument) -> Option<usize> {
+    let mut stack = vec![doc.root_element().id];
+    while let Some(node_id) = stack.pop() {
+        let node = doc.get_node(node_id)?;
+        if let Some(el) = node.element_data() {
+            let has_dioxus_id = el.attrs().iter().any(|a| a.name.local.as_ref() == "data-dioxus-id");
+            if has_dioxus_id {
+                return Some(node_id);
+            }
+        }
+        // Push children in reverse so we visit in document order
+        for &child_id in node.children.iter().rev() {
+            stack.push(child_id);
+        }
+    }
+    None
+}
 
 pub trait EventHandler {
     fn handle_event(
@@ -163,31 +183,14 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             UiEvent::Ime(data) => DomEventData::Ime(data),
         };
 
-        // When no element has focus (keyboard/IME events), target the body's
-        // first child element rather than the root <html>. This ensures keyboard
-        // events bubble through the Dioxus component tree where handlers are
-        // registered, not through the bare <html> element which has no dioxus-id.
+        // When no element has focus (keyboard/IME events), target the first
+        // Dioxus-managed element in the tree. The raw <html>/<body>/<main>
+        // wrapper elements don't have data-dioxus-id attributes, so events
+        // dispatched to them skip all Dioxus handlers. Walk the tree depth-first
+        // to find the first element with a dioxus-id.
         let target = target.unwrap_or_else(|| {
             let doc = self.doc.inner();
-            let root = doc.root_element();
-            // Find <body> (second child of <html>, after <head>)
-            use markup5ever::local_name;
-            root.children
-                .iter()
-                .filter_map(|&id| doc.get_node(id))
-                .find(|n| {
-                    n.element_data()
-                        .is_some_and(|e| e.name.local == local_name!("body"))
-                })
-                .and_then(|body| {
-                    // Target the body's first child element (Dioxus content root)
-                    body.children
-                        .iter()
-                        .filter_map(|&id| doc.get_node(id))
-                        .find(|n| n.element_data().is_some())
-                        .map(|n| n.id)
-                })
-                .unwrap_or(root.id)
+            find_first_dioxus_element(&*doc).unwrap_or(doc.root_element().id)
         });
         let dom_event = DomEvent::new(target, data);
 

@@ -312,15 +312,20 @@ impl EventHandler for DioxusEventHandler<'_> {
             return;
         };
 
-        eprintln!("[blitz] handle_event: name={} chain_len={} kind_idx={}", event.name(), chain.len(), event_kind_idx);
+        eprintln!("[blitz] handle_event: name={} chain_len={} kind_idx={} target={}", event.name(), chain.len(), event_kind_idx, event.target);
         for &node_id in chain {
             // Get dioxus vdom id for node
             let dioxus_id = doc.inner().get_node(node_id).and_then(get_dioxus_id);
+            let tag = doc.inner().get_node(node_id)
+                .and_then(|n| n.element_data())
+                .map(|e| e.name.local.to_string())
+                .unwrap_or_else(|| "?".into());
+            eprintln!("[blitz]   chain node_id={} tag={} dioxus_id={:?}", node_id, tag, dioxus_id);
             let Some(id) = dioxus_id else {
                 continue;
             };
 
-            eprintln!("[blitz]   dispatching to dioxus_id={:?} node_id={}", id, node_id);
+            eprintln!("[blitz]   >>> dispatching to dioxus_id={:?} node_id={}", id, node_id);
             // Handle event in vdom
             let dx_event = Event::new(event_data.clone(), event.bubbles);
             self.vdom
