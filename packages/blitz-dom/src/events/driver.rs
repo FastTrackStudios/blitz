@@ -163,7 +163,32 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             UiEvent::Ime(data) => DomEventData::Ime(data),
         };
 
-        let target = target.unwrap_or_else(|| self.doc.inner().root_element().id);
+        // When no element has focus (keyboard/IME events), target the body's
+        // first child element rather than the root <html>. This ensures keyboard
+        // events bubble through the Dioxus component tree where handlers are
+        // registered, not through the bare <html> element which has no dioxus-id.
+        let target = target.unwrap_or_else(|| {
+            let doc = self.doc.inner();
+            let root = doc.root_element();
+            // Find <body> (second child of <html>, after <head>)
+            use markup5ever::local_name;
+            root.children
+                .iter()
+                .filter_map(|&id| doc.get_node(id))
+                .find(|n| {
+                    n.element_data()
+                        .is_some_and(|e| e.name.local == local_name!("body"))
+                })
+                .and_then(|body| {
+                    // Target the body's first child element (Dioxus content root)
+                    body.children
+                        .iter()
+                        .filter_map(|&id| doc.get_node(id))
+                        .find(|n| n.element_data().is_some())
+                        .map(|n| n.id)
+                })
+                .unwrap_or(root.id)
+        });
         let dom_event = DomEvent::new(target, data);
 
         self.handle_dom_event(dom_event);

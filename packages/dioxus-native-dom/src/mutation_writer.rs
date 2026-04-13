@@ -285,6 +285,9 @@ impl WriteMutations for MutationWriter<'_> {
         if let Ok(kind) = DomEventKind::from_str(name) {
             let idx = kind.discriminant() as usize;
             self.state.event_handler_counts[idx] += 1;
+            eprintln!("[blitz] Event listener registered: name={name} idx={idx} count={}", self.state.event_handler_counts[idx]);
+        } else {
+            eprintln!("[blitz] Event listener NOT mapped: name={name}");
         }
     }
 
