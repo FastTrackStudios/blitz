@@ -126,10 +126,11 @@ pub(crate) fn handle_mousedown(
     doc.is_selecting = false;
 
     let Some(hit) = doc.hit(x, y) else {
-        // Clear text selection when clicking outside any element
+        eprintln!("[blitz] mousedown: hit test returned None at ({}, {})", x, y);
         doc.clear_text_selection();
         return;
     };
+    eprintln!("[blitz] mousedown: hit test result node_id={} x={} y={}", hit.node_id, hit.x, hit.y);
 
     // Use hit.node_id for determining the actual clicked element.
     // This may differ from `target` for anonymous blocks (which are layout children
@@ -147,6 +148,13 @@ pub(crate) fn handle_mousedown(
 
     // Try the hit target first, then walk descendants to find a text input.
     // This handles click-on-wrapper-div → focus the <input> inside it.
+    eprintln!("[blitz] handle_mousedown: x={} y={}", x, y);
+    {
+        let node = &doc.nodes[actual_target];
+        let tag = node.data.downcast_element().map(|e| e.name.local.as_ref()).unwrap_or("?");
+        let is_ti = node.data.downcast_element().is_some_and(|e| matches!(e.special_data, SpecialElementData::TextInput(_)));
+        eprintln!("[blitz] mousedown _target={} actual_target={} tag={} is_text_input={}", _target, actual_target, tag, is_ti);
+    }
     let (actual_target, click_target) = {
         let mut target_id = actual_target;
         let mut found = None;
@@ -157,6 +165,7 @@ pub(crate) fn handle_mousedown(
             if el.has_attr(local_name!("disabled")) {
                 found = Some((target_id, ClickTarget::Disabled));
             } else if let SpecialElementData::TextInput(ref text_input_data) = el.special_data {
+                eprintln!("[blitz] found TextInput at node_id={}, has_layout={}", target_id, text_input_data.editor.try_layout().is_some());
                 let mut content_box_offset = taffy::Point {
                     x: node.final_layout.padding.left + node.final_layout.border.left,
                     y: node.final_layout.padding.top + node.final_layout.border.top,
@@ -245,6 +254,7 @@ pub(crate) fn handle_mousedown(
                 drop(font_ctx);
             }
 
+            eprintln!("[blitz] setting focus to node_id={}", actual_target);
             generate_focus_events(
                 doc,
                 &mut |doc| {
@@ -252,6 +262,7 @@ pub(crate) fn handle_mousedown(
                 },
                 dispatch_event,
             );
+            eprintln!("[blitz] focus_node_id after set = {:?}", doc.focus_node_id);
         }
     }
 }
