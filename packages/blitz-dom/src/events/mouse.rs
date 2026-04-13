@@ -145,30 +145,61 @@ pub(crate) fn handle_mousedown(
         SelectableText,
     }
 
-    let click_target = {
-        let node = &doc.nodes[actual_target];
-        match node.data.downcast_element() {
-            Some(el) if el.has_attr(local_name!("disabled")) => ClickTarget::Disabled,
-            Some(el) => {
-                if let SpecialElementData::TextInput(ref text_input_data) = el.special_data {
-                    let mut content_box_offset = taffy::Point {
-                        x: node.final_layout.padding.left + node.final_layout.border.left,
-                        y: node.final_layout.padding.top + node.final_layout.border.top,
-                    };
-                    if !text_input_data.is_multiline {
-                        let layout = text_input_data.editor.try_layout().unwrap();
-                        let content_box_height = node.final_layout.content_box_height();
-                        let input_height = layout.height() / layout.scale();
-                        let y_offset = ((content_box_height - input_height) / 2.0).max(0.0);
-                        content_box_offset.y += y_offset;
-                    }
-                    ClickTarget::TextInput { content_box_offset }
-                } else {
-                    ClickTarget::SelectableText
+    // Try the hit target first, then walk descendants to find a text input.
+    // This handles click-on-wrapper-div → focus the <input> inside it.
+    let (actual_target, click_target) = {
+        let mut target_id = actual_target;
+        let mut found = None;
+
+        // Check the hit target itself
+        let node = &doc.nodes[target_id];
+        if let Some(el) = node.data.downcast_element() {
+            if el.has_attr(local_name!("disabled")) {
+                found = Some((target_id, ClickTarget::Disabled));
+            } else if let SpecialElementData::TextInput(ref text_input_data) = el.special_data {
+                let mut content_box_offset = taffy::Point {
+                    x: node.final_layout.padding.left + node.final_layout.border.left,
+                    y: node.final_layout.padding.top + node.final_layout.border.top,
+                };
+                if !text_input_data.is_multiline {
+                    let layout = text_input_data.editor.try_layout().unwrap();
+                    let content_box_height = node.final_layout.content_box_height();
+                    let input_height = layout.height() / layout.scale();
+                    let y_offset = ((content_box_height - input_height) / 2.0).max(0.0);
+                    content_box_offset.y += y_offset;
                 }
+                found = Some((target_id, ClickTarget::TextInput { content_box_offset }));
             }
-            None => ClickTarget::SelectableText,
         }
+
+        // If not found, walk descendants depth-first to find a text input child
+        if found.is_none() {
+            let mut stack: Vec<usize> = doc.nodes[target_id].children.clone();
+            while let Some(child_id) = stack.pop() {
+                if let Some(el) = doc.nodes[child_id].data.downcast_element() {
+                    if let SpecialElementData::TextInput(ref text_input_data) = el.special_data {
+                        let child_node = &doc.nodes[child_id];
+                        let mut content_box_offset = taffy::Point {
+                            x: child_node.final_layout.padding.left + child_node.final_layout.border.left,
+                            y: child_node.final_layout.padding.top + child_node.final_layout.border.top,
+                        };
+                        if !text_input_data.is_multiline {
+                            let layout = text_input_data.editor.try_layout().unwrap();
+                            let content_box_height = child_node.final_layout.content_box_height();
+                            let input_height = layout.height() / layout.scale();
+                            let y_offset = ((content_box_height - input_height) / 2.0).max(0.0);
+                            content_box_offset.y += y_offset;
+                        }
+                        target_id = child_id;
+                        found = Some((child_id, ClickTarget::TextInput { content_box_offset }));
+                        break;
+                    }
+                }
+                stack.extend(doc.nodes[child_id].children.iter());
+            }
+        }
+
+        found.unwrap_or((actual_target, ClickTarget::SelectableText))
     };
 
     match click_target {
@@ -217,7 +248,7 @@ pub(crate) fn handle_mousedown(
             generate_focus_events(
                 doc,
                 &mut |doc| {
-                    doc.set_focus_to(hit.node_id);
+                    doc.set_focus_to(actual_target);
                 },
                 dispatch_event,
             );
