@@ -883,6 +883,8 @@ dependencies = [
  "kurbo 0.12.0",
  "parley",
  "peniko",
+ "skrifa",
+ "smallvec",
  "stylo",
  "taffy",
  "tracing",
