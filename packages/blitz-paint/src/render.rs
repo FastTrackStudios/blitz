@@ -539,23 +539,27 @@ impl ElementCx<'_> {
 
     /// Resolve `text-overflow: ellipsis` from this node's style. Returns a
     /// default (no-op) truncation when the spec conditions aren't met.
+    ///
+    /// CSS UI §8.2 wire-up:
+    /// - `text-overflow` takes 1 or 2 `TextOverflowSide` values. A single
+    ///   value maps to `{ first: Clip, second: <value> }` — it's applied to
+    ///   the inline end of the line in the writing direction (right for LTR,
+    ///   left for RTL), while the start side remains clipped. A two-value
+    ///   form sets start / end independently.
+    /// - We treat truncation as active whenever EITHER side requests
+    ///   ellipsis. The cut-off itself is still single-sided (end) in this
+    ///   first pass; bidi-aware start-side ellipsis is follow-up work.
     fn compute_text_truncation(&self) -> crate::text::TextTruncation {
         use style::values::specified::text::TextOverflowSide;
         let box_styles = self.style.get_box();
-        let clips_inline = !matches!(box_styles.overflow_x, Overflow::Visible);
-        if !clips_inline {
+        if matches!(box_styles.overflow_x, Overflow::Visible) {
             return crate::text::TextTruncation::default();
         }
-        let text_styles = self.style.get_text();
-        let wants_ellipsis = matches!(
-            text_styles.text_overflow.first,
-            TextOverflowSide::Ellipsis
-        );
-        // Max advance in layout units — Parley glyph positions and our
-        // `transform` are in the same pre-scale space.
-        let max_advance = self.node.final_layout.size.width as f32;
+        let text_overflow = &self.style.get_text().text_overflow;
+        let wants_ellipsis = matches!(text_overflow.first, TextOverflowSide::Ellipsis)
+            || matches!(text_overflow.second, TextOverflowSide::Ellipsis);
         crate::text::TextTruncation {
-            max_advance: Some(max_advance),
+            max_advance: Some(self.node.final_layout.size.width as f32),
             ellipsis: wants_ellipsis,
         }
     }
