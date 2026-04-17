@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>text-overflow showcase</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    h1 { font-size: 20px; margin-bottom: 8px; }
+    h2 { font-size: 14px; color: #555; margin: 20px 0 8px; font-weight: 500; }
+    .case {
+      width: 200px;
+      border: 1px solid #bbb;
+      background: #f7f7f7;
+      padding: 8px;
+      white-space: nowrap;
+      overflow: hidden;
+      margin-bottom: 4px;
+      font-size: 14px;
+    }
+    .clip { text-overflow: clip; }
+    .ellipsis { text-overflow: ellipsis; }
+    .row { display: flex; gap: 24px; }
+    .col { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>text-overflow</h1>
+  <p>
+    Requires <code>white-space: nowrap</code> and
+    <code>overflow: hidden | scroll | clip | auto</code> to activate.
+    This fixture exercises <code>text-overflow: clip</code> (default) and
+    <code>text-overflow: ellipsis</code>.
+  </p>
+
+  <div class="row">
+    <div class="col">
+      <h2>clip (default)</h2>
+      <div class="case clip">The quick brown fox jumps over the lazy dog</div>
+      <div class="case clip">Short text</div>
+      <div class="case clip">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+    </div>
+    <div class="col">
+      <h2>ellipsis</h2>
+      <div class="case ellipsis">The quick brown fox jumps over the lazy dog</div>
+      <div class="case ellipsis">Short text</div>
+      <div class="case ellipsis">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+    </div>
+  </div>
+
+  <h2>Edge cases (ellipsis)</h2>
+  <div class="case ellipsis" style="width: 30px;">Tiny</div>
+  <div class="case ellipsis" style="width: 10px;">X</div>
+  <div class="case ellipsis" style="width: 200px; direction: rtl;">مرحبا بالعالم، هذا اختبار</div>
+  <div class="case ellipsis" style="width: 200px;">🙂 emoji clusters test 🎉 with extra length</div>
+</body>
+</html>
