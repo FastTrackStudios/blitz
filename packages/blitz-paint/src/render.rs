@@ -197,6 +197,27 @@ impl<'dom> BlitzDomPainter<'dom> {
             return;
         };
 
+        // CSS 2 §9.4 / CSS Position 3: `position: fixed` takes the element
+        // out of the scrollable flow — its containing block is the viewport.
+        // Stylo→Taffy maps Fixed → Absolute, so layout already gives us a
+        // viewport-relative offset at the root level; we just need to
+        // un-apply the viewport scroll that was subtracted at paint_scene.
+        // This covers the common case: toasts / dropdowns / modals mounted
+        // on <body>. Nested fixed descendants and transform-containing-block
+        // semantics are follow-ups.
+        let location = if matches!(
+            styles.get_box().position,
+            style::properties::longhands::position::computed_value::T::Fixed
+        ) {
+            let scroll = self.dom.as_ref().viewport_scroll();
+            Point {
+                x: location.x + scroll.x,
+                y: location.y + scroll.y,
+            }
+        } else {
+            location
+        };
+
         // Hide inputs with type=hidden
         // Implemented here rather than using the style engine for performance reasons
         if node.local_name() == "input" && node.attr(local_name!("type")) == Some("hidden") {
