@@ -7,11 +7,29 @@ use style::values::computed::TextDecorationLine;
 
 use crate::SELECTION_COLOR;
 
+/// Constraints used to truncate a single-line inline layout when
+/// `overflow: {hidden,clip,scroll,auto}` is combined with
+/// `text-overflow: ellipsis` (CSS UI Level 3 §8.2).
+///
+/// `None` disables truncation and restores the default clip-at-box behaviour.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct TextTruncation {
+    /// Maximum line advance, in CSS px (pre-transform). The glyph stream is
+    /// cut off once this width minus the ellipsis advance would be exceeded.
+    pub max_advance: Option<f32>,
+    /// When true, an ellipsis (U+2026) is drawn at the cutoff. When false
+    /// the glyphs are simply clipped (equivalent to `text-overflow: clip`).
+    pub ellipsis: bool,
+}
+
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
     doc: &BaseDocument,
     transform: Affine,
+    // TODO(experimental-css): honour this in the glyph loop — currently a no-op.
+    // Threading it through first to keep the plumbing change reviewable on its own.
+    _truncation: TextTruncation,
 ) {
     for line in lines {
         for item in line.items() {
