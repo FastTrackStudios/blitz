@@ -489,16 +489,44 @@ impl ElementCx<'_> {
                 );
             }
 
+            // CSS UI §8.2: text-overflow activates when `overflow-x` is one of
+            // hidden/clip/scroll/auto on the block container holding the text.
+            // We read the inline root's own overflow/text-overflow. Multi-line
+            // detection is follow-up; for now the first line carries the
+            // ellipsis (covers `white-space: nowrap` + `overflow: hidden`).
+            let truncation = self.compute_text_truncation();
+
             // Render text
             crate::text::stroke_text(
                 scene,
                 text_layout.layout.lines(),
                 self.context.dom,
                 transform,
-                // TODO(experimental-css): derive from overflow + text-overflow styles
-                // of this node once the CSS wiring lands in blitz-dom.
-                crate::text::TextTruncation::default(),
+                truncation,
             );
+        }
+    }
+
+    /// Resolve `text-overflow: ellipsis` from this node's style. Returns a
+    /// default (no-op) truncation when the spec conditions aren't met.
+    fn compute_text_truncation(&self) -> crate::text::TextTruncation {
+        use style::values::specified::text::TextOverflowSide;
+        let box_styles = self.style.get_box();
+        let clips_inline = !matches!(box_styles.overflow_x, Overflow::Visible);
+        if !clips_inline {
+            return crate::text::TextTruncation::default();
+        }
+        let text_styles = self.style.get_text();
+        let wants_ellipsis = matches!(
+            text_styles.text_overflow.first,
+            TextOverflowSide::Ellipsis
+        );
+        // Max advance in layout units — Parley glyph positions and our
+        // `transform` are in the same pre-scale space.
+        let max_advance = self.node.final_layout.size.width as f32;
+        crate::text::TextTruncation {
+            max_advance: Some(max_advance),
+            ellipsis: wants_ellipsis,
         }
     }
 
