@@ -161,8 +161,17 @@ fn paint_line<'a>(
         let has_strikethrough = text_decoration_line.contains(TextDecorationLine::LINE_THROUGH);
 
         // Reserve space for the ellipsis in this run's font (if we might need it).
+        // Per CSS UI §8.2: if the container is too narrow to fit the ellipsis
+        // at all, fall back to clip behaviour (no ellipsis). Detect that by
+        // checking whether `max_advance` is greater than the ellipsis width.
         let ellipsis_reserve = reserve_advance(font, font_size, &mut ellipsis);
-        let cutoff = max_advance.map(|m| m - ellipsis_reserve);
+        let cutoff = max_advance.and_then(|m| {
+            if want_ellipsis && m <= ellipsis_reserve {
+                None // container too small for the ellipsis; behave like clip
+            } else {
+                Some(m - ellipsis_reserve)
+            }
+        });
 
         // Decide which glyphs actually fit. `glyph.x` is the layout-absolute
         // origin of the glyph along the inline axis.
