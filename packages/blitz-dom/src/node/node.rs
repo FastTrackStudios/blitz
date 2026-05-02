@@ -742,10 +742,25 @@ impl Node {
 
     pub fn write_outer_html(&self, writer: &mut String) {
         let has_children = !self.children.is_empty();
-        let current_color = self
-            .primary_styles()
-            .map(|style| style.clone_color())
-            .map(|color| color.to_css_string());
+        // usvg (`svgtypes` parser) only accepts CSS Color 3 syntax —
+        // `oklch()` / `oklab()` / `color()` are silently dropped, which
+        // turns SVGs using `currentColor` invisible whenever Stylo's
+        // computed `color` lives in a non-sRGB space. Convert to sRGB
+        // and emit `rgba()` so the substitution always parses.
+        let current_color = self.primary_styles().map(|style| {
+            let srgb = style
+                .clone_color()
+                .to_color_space(style::color::ColorSpace::Srgb);
+            let [r, g, b, a] = *srgb.raw_components();
+            let to_byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+            format!(
+                "rgba({}, {}, {}, {:.4})",
+                to_byte(r),
+                to_byte(g),
+                to_byte(b),
+                a.clamp(0.0, 1.0)
+            )
+        });
 
         match &self.data {
             NodeData::Document => {}

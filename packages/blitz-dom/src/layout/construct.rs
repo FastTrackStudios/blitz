@@ -16,6 +16,25 @@ use style::{
         specified::box_::{DisplayInside, DisplayOutside},
     },
 };
+/// Format an sRGB color as a CSS `rgba()` string usvg can parse.
+///
+/// Stylo's `Color::to_css_string()` formats absolute colors in their
+/// computed color space, which is increasingly `oklch()` for modern
+/// content. usvg's color parser (`svgtypes`) only accepts CSS Color 3
+/// syntax — hex, named colors, `rgb()`, `rgba()`, `hsl()`, `hsla()` —
+/// and silently rejects `oklch()` / `oklab()` / `color()` etc.,
+/// dropping affected paints to invisible. Always emit `rgba()` here.
+#[cfg(feature = "svg")]
+fn format_srgb_for_usvg(r: f32, g: f32, b: f32, a: f32) -> String {
+    let to_byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "rgba({}, {}, {}, {:.4})",
+        to_byte(r),
+        to_byte(g),
+        to_byte(b),
+        a.clamp(0.0, 1.0)
+    )
+}
 
 use crate::{
     BaseDocument, ElementData, Node, NodeData,
@@ -129,7 +148,33 @@ pub(crate) fn collect_layout_children(
 
         #[cfg(feature = "svg")]
         if matches!(tag_name, "svg") {
-            let mut outer_html = doc.get_node(container_node_id).unwrap().outer_html();
+            let svg_node = doc.get_node(container_node_id).unwrap();
+            let mut outer_html = svg_node.outer_html();
+
+            // Inject the inline `<svg>`'s computed `color` as the SVG `color`
+            // presentation attribute. usvg resolves `currentColor` (e.g.
+            // `stroke="currentColor"`) by walking up to find the SVG tree's
+            // `color` attribute and falls back to black if absent
+            // (`usvg/src/parser/style.rs`, `Paint::CurrentColor` arm).
+            // Without this, every inline SVG using `currentColor` paints
+            // black regardless of the surrounding CSS — invisible on dark
+            // themes and the proximate cause of "Tailwind `animate-spin` SVG
+            // spinner vanishes" on dioxus-native apps. The `color` attribute
+            // is inherited by SVG children, so injecting it once on the root
+            // suffices for the whole tree.
+            if !outer_html.contains(" color=\"") {
+                let svg_color = svg_node.primary_styles().map(|style| {
+                    let srgb = style
+                        .clone_color()
+                        .to_color_space(style::color::ColorSpace::Srgb);
+                    let [r, g, b, a] = *srgb.raw_components();
+                    format_srgb_for_usvg(r, g, b, a)
+                });
+                if let Some(color) = svg_color {
+                    outer_html = outer_html
+                        .replacen("<svg", &format!("<svg color=\"{color}\""), 1);
+                }
+            }
 
             // HACK: usvg fails to parse SVGs that don't have the SVG xmlns set. So inject it
             // if the generated source doesn't have it.
