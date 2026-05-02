@@ -132,10 +132,18 @@ impl HtmlEventConverter for NativeConverter {
     }
 }
 
+/// Pending focus / blur action queued from a `set_focus` future,
+/// drained by `DioxusDocument::poll` after the active event-dispatch
+/// borrow on the document has been released.
+///
+/// `bool` is `true` for focus, `false` for blur.
+pub type PendingFocusActions = Rc<RefCell<Vec<(NodeId, bool)>>>;
+
 #[derive(Clone)]
 pub struct NodeHandle {
     pub(crate) doc: Rc<RefCell<BaseDocument>>,
     pub(crate) node_id: NodeId,
+    pub(crate) pending_focus: PendingFocusActions,
 }
 
 impl NodeHandle {
@@ -231,16 +239,21 @@ impl RenderedElementBacking for NodeHandle {
     }
 
     fn set_focus(&self, focus: bool) -> Pin<Box<dyn Future<Output = MountedResult<()>>>> {
-        let mut doc = self.doc_mut();
-        if focus {
-            // TODO: queue focus events somehow
-            doc.set_focus_to(self.node_id);
-        } else if doc.get_focussed_node_id() == Some(self.node_id) {
-            // Q: Should this only clear focus if the node is focussed?
-            // TODO: queue blur events somehow
-            doc.clear_focus();
-        }
-
+        // Queue the focus change for later instead of borrowing the
+        // document right now. dioxus-primitives (Dropdown, Select,
+        // Popover, …) calls `mounted.set_focus(true).await` from a
+        // `spawn`ed task that the Dioxus runtime polls inside its
+        // event-dispatch loop — at the very moment Blitz still holds
+        // a `borrow_mut` on the document for the same RefCell. Doing
+        // the focus mutation here panics with `RefCell already
+        // borrowed`. Earlier fix attempts that "deferred the borrow
+        // into the returned future" don't help, because the future
+        // is what's being polled inside that re-entrant window.
+        //
+        // `DioxusDocument::poll` drains this queue while it owns the
+        // mutable borrow, so the focus / blur actually happens —
+        // it's just batched until the call-stack is safe.
+        self.pending_focus.borrow_mut().push((self.node_id, focus));
         Box::pin(async { Ok(()) })
     }
 }
