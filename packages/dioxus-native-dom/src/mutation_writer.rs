@@ -360,13 +360,123 @@ fn set_attribute_inner(
     match value {
         None => docm.clear_attribute(node_id, name),
         Some(value) => {
-            if local_name == "checked" && is_falsy {
+            // HTML "boolean attributes" — `disabled`, `checked`,
+            // `required`, `readonly`, `multiple`, etc. — are true by
+            // **presence**, not by value: `disabled="false"` is still
+            // disabled per the HTML spec. Blitz / Stylo correctly
+            // honour that (see the `ignore_disabled_attr_content`
+            // test in blitz-dom). Dioxus, however, frequently emits
+            // `AttributeValue::Bool(false)` for `disabled`, `checked`,
+            // etc.; without clearing those at the writer layer, every
+            // "enabled" button / "unchecked" input ends up with the
+            // boolean attribute set to the string "false" — and so
+            // Blitz renders them all as disabled / checked.
+            //
+            // Chromium-based renderers (used by `dioxus-desktop`) hide
+            // this divergence because their JS interpreter side
+            // strips falsy boolean attributes before they reach the
+            // DOM. Native renderers don't have that layer, so the
+            // mismatch is visible. Mirror the behaviour here.
+            if is_falsy && is_html_boolean_attribute(local_name) {
                 docm.clear_attribute(node_id, name);
             } else if local_name == "dangerous_inner_html" {
                 docm.set_inner_html(node_id, value);
             } else {
                 docm.set_attribute(node_id, name, value);
             }
+        }
+    }
+}
+
+/// HTML "boolean attributes" — present-or-absent semantics, value
+/// ignored. Per the HTML Living Standard:
+///
+/// > The presence of a boolean attribute on an element represents the
+/// > true value, and the absence of the attribute represents the false
+/// > value.
+///
+/// Source list:
+/// <https://html.spec.whatwg.org/multipage/indices.html#attributes-3>
+/// (every row whose "Value" column is "Boolean attribute"), plus a
+/// few legacy/deprecated forms still in the wild.
+fn is_html_boolean_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "allowfullscreen"
+            | "async"
+            | "autofocus"
+            | "autoplay"
+            | "checked"
+            | "controls"
+            | "default"
+            | "defer"
+            | "disabled"
+            | "formnovalidate"
+            | "hidden"
+            | "inert"
+            | "ismap"
+            | "itemscope"
+            | "loop"
+            | "multiple"
+            | "muted"
+            | "nomodule"
+            | "novalidate"
+            | "open"
+            | "playsinline"
+            | "readonly"
+            | "required"
+            | "reversed"
+            | "selected"
+            | "truespeed"
+    )
+}
+
+#[cfg(test)]
+mod boolean_attr_tests {
+    //! Regression tests: dioxus emits `AttributeValue::Bool(false)` for
+    //! every unset boolean prop (`disabled: false`, `checked: false`,
+    //! `required: false`, …). Blitz's HTML parser is spec-correct and
+    //! treats attribute *presence* as the boolean state, so a stray
+    //! `disabled="false"` ends up disabled in the rendered DOM. The
+    //! mutation writer therefore has to strip falsy boolean attributes
+    //! before they reach `set_attribute`.
+    //!
+    //! Chromium-based renderers (`dioxus-desktop`) hide this because
+    //! their JS interpreter side filters falsy booleans first. Native
+    //! does not — making this a real cross-renderer parity bug. See
+    //! the comment in `set_attribute_inner` for full context.
+    use super::*;
+
+    #[test]
+    fn known_boolean_attributes() {
+        for attr in [
+            "disabled",
+            "checked",
+            "required",
+            "readonly",
+            "multiple",
+            "selected",
+            "hidden",
+            "open",
+            "autofocus",
+            "controls",
+            "loop",
+        ] {
+            assert!(
+                is_html_boolean_attribute(attr),
+                "expected `{attr}` to be classified as an HTML boolean attribute"
+            );
+        }
+    }
+
+    #[test]
+    fn non_boolean_attributes_passthrough() {
+        for attr in ["class", "id", "title", "value", "type", "data-x", "aria-disabled"] {
+            assert!(
+                !is_html_boolean_attribute(attr),
+                "did not expect `{attr}` to be classified as an HTML boolean attribute \
+                 — it should pass through verbatim"
+            );
         }
     }
 }
