@@ -185,7 +185,15 @@ impl DioxusDocument {
         for element_id in queued_mounted_events.drain(..) {
             let node_id = self.vdom_state.element_to_node_id(element_id);
 
-            if self.inner.borrow().get_node(node_id).is_some() {
+            // Bind the borrow result to a `let` so the `Ref` is dropped
+            // before we invoke the user `mounted` handler. The previous
+            // `if self.inner.borrow().get_node(..).is_some() { ... }`
+            // pattern kept the temporary alive for the entire `if` body
+            // (per Rust's temporary scope rule), so any handler that
+            // touched the document via `NodeHandle::doc_mut()` would
+            // panic with "RefCell already borrowed".
+            let exists = self.inner.borrow().get_node(node_id).is_some();
+            if exists {
                 let event = Event::new(
                     Rc::new(PlatformEventData::new(Box::new(NodeHandle {
                         doc: Rc::clone(&self.inner),
