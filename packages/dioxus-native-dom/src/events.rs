@@ -205,14 +205,23 @@ impl RenderedElementBacking for NodeHandle {
     }
 
     fn get_client_rect(&self) -> Pin<Box<dyn Future<Output = MountedResult<PixelsRect>>>> {
-        let Some(bounding_rect) = self.doc_mut().get_client_bounding_rect(self.node_id) else {
-            return self.node_not_exist_err();
-        };
-        let pixels_rect = PixelsRect::new(
-            Point2D::new(bounding_rect.x, bounding_rect.y),
-            Size2D::new(bounding_rect.width, bounding_rect.height),
-        );
-        Box::pin(async move { Ok(pixels_rect) })
+        // Perform the document borrow inside the returned future so that
+        // callers from inside an event-dispatch borrow (e.g. dispatched via
+        // `vdom.runtime().handle_event`) do not re-enter the RefCell. The
+        // future is polled later — typically from a `spawn`ed task — when no
+        // sibling borrow is alive.
+        let doc = Rc::clone(&self.doc);
+        let node_id = self.node_id;
+        let not_exist = self.node_not_exist_err();
+        Box::pin(async move {
+            match doc.borrow_mut().get_client_bounding_rect(node_id) {
+                Some(bounding_rect) => Ok(PixelsRect::new(
+                    Point2D::new(bounding_rect.x, bounding_rect.y),
+                    Size2D::new(bounding_rect.width, bounding_rect.height),
+                )),
+                None => not_exist.await,
+            }
+        })
     }
 
     fn scroll_to(
@@ -231,17 +240,26 @@ impl RenderedElementBacking for NodeHandle {
     }
 
     fn set_focus(&self, focus: bool) -> Pin<Box<dyn Future<Output = MountedResult<()>>>> {
-        let mut doc = self.doc_mut();
-        if focus {
-            // TODO: queue focus events somehow
-            doc.set_focus_to(self.node_id);
-        } else if doc.get_focussed_node_id() == Some(self.node_id) {
-            // Q: Should this only clear focus if the node is focussed?
-            // TODO: queue blur events somehow
-            doc.clear_focus();
-        }
-
-        Box::pin(async { Ok(()) })
+        // Defer the document borrow into the returned future so that
+        // synchronous callers do not race with an active event-dispatch
+        // borrow on the same RefCell. dioxus-primitives, for example, calls
+        // `mounted.set_focus(true).await` from a `spawn`ed task; doing the
+        // borrow before returning the future panics if the caller is itself
+        // running inside a `borrow()` chain that has not yet been released.
+        let doc = Rc::clone(&self.doc);
+        let node_id = self.node_id;
+        Box::pin(async move {
+            let mut doc = doc.borrow_mut();
+            if focus {
+                // TODO: queue focus events somehow
+                doc.set_focus_to(node_id);
+            } else if doc.get_focussed_node_id() == Some(node_id) {
+                // Q: Should this only clear focus if the node is focussed?
+                // TODO: queue blur events somehow
+                doc.clear_focus();
+            }
+            Ok(())
+        })
     }
 }
 
@@ -510,5 +528,74 @@ impl InteractionLocation for NativeWheelData {
 
     fn page_coordinates(&self) -> PagePoint {
         PagePoint::new(self.0.page_x() as f64, self.0.page_y() as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for re-entrant `RefCell` borrows on the document.
+    //!
+    //! Prior to the fix, `RenderedElementBacking::set_focus` and
+    //! `get_client_rect` performed `self.doc_mut()` (i.e. `borrow_mut()`)
+    //! synchronously, before returning the future they hand back to
+    //! callers. dioxus-primitives' `Select`, `DropdownMenu`, `Tabs`,
+    //! `ContextMenu`, and `Menubar` all call `mounted.set_focus(true).await`
+    //! from a `spawn`ed task triggered by a `use_effect`. The effect runs
+    //! inside the dioxus runtime which may be polled while another
+    //! borrow on the same `Rc<RefCell<BaseDocument>>` is alive (e.g. the
+    //! event-driver's dispatch borrow), producing a panic at the call
+    //! site:
+    //!
+    //! ```text
+    //! thread 'main' panicked at packages/dioxus-native-dom/src/events.rs:
+    //! RefCell already borrowed
+    //! ```
+    //!
+    //! These tests construct a `NodeHandle` directly, hold a borrow on
+    //! the underlying `RefCell`, and then invoke the trait methods. With
+    //! the fix in place the trait methods only build a future and do not
+    //! take any borrow, so the synchronous calls succeed.
+
+    use super::*;
+    use blitz_dom::BaseDocument;
+    use blitz_traits::shell::{ColorScheme, Viewport};
+    use dioxus_html::RenderedElementBacking;
+
+    fn make_doc() -> Rc<RefCell<BaseDocument>> {
+        let mut config = blitz_dom::DocumentConfig::default();
+        config.viewport = Some(Viewport::new(800, 600, 1.0, ColorScheme::Light));
+        Rc::new(RefCell::new(BaseDocument::new(config)))
+    }
+
+    #[test]
+    fn set_focus_does_not_borrow_synchronously() {
+        let doc = make_doc();
+        let node_id = doc.borrow().root_node().id;
+        let handle = NodeHandle {
+            doc: Rc::clone(&doc),
+            node_id,
+        };
+
+        // Simulate an active dispatch borrow on the document.
+        let _guard = doc.borrow();
+
+        // Pre-fix this would panic with "RefCell already borrowed".
+        let _fut = handle.set_focus(true);
+        let _fut = handle.set_focus(false);
+    }
+
+    #[test]
+    fn get_client_rect_does_not_borrow_synchronously() {
+        let doc = make_doc();
+        let node_id = doc.borrow().root_node().id;
+        let handle = NodeHandle {
+            doc: Rc::clone(&doc),
+            node_id,
+        };
+
+        let _guard = doc.borrow_mut();
+
+        // Pre-fix this would panic with "RefCell already borrowed".
+        let _fut = handle.get_client_rect();
     }
 }
