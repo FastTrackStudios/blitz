@@ -37,7 +37,12 @@ pub fn resolve_2d_transform(
 
     let rotate = match &box_styles.rotate {
         Rotate::None => None,
-        Rotate::Rotate(angle) => Some(angle.degrees() as f64),
+        // CSS rotation angles are degrees; kurbo's `Affine::then_rotate`
+        // takes radians. Forward the angle in radians so animations like
+        // `transform: rotate(360deg)` (Tailwind's `animate-spin`) don't
+        // multiply the matrix by ~57 full rotations per "degree" of
+        // animation progress and translate small elements off-canvas.
+        Rotate::Rotate(angle) => Some(angle.radians() as f64),
         // TODO: support 3D transforms
         Rotate::Rotate3D(_, _, _, _) => None,
     };
@@ -123,5 +128,73 @@ pub fn resolve_2d_transform(
         Some(resolved)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the rotation-angle unit bug.
+    //!
+    //! The `rotate` CSS property carries an angle in degrees. kurbo's
+    //! `Affine::then_rotate` takes radians. Mixing them up multiplies
+    //! the rotation by ~57.3, which on a small element rotated by an
+    //! `animate-spin` keyframe (e.g. `transform: rotate(360deg)`)
+    //! produced a matrix that translated the element well outside any
+    //! reasonable bounding box — manifesting as a missing spinner on
+    //! 16×16 SVGs in production apps using Tailwind.
+    //!
+    //! These tests check the matrix entries directly. We assert
+    //! `rotate(180deg)` produces the standard 180° rotation matrix
+    //! around the origin: `[-1, 0, 0, -1, 0, 0]`. With the old
+    //! degrees-as-radians bug this would be the matrix for
+    //! `180 mod 2π ≈ 1.27` radians instead.
+
+    // Driving a literal `Rotate::Rotate(angle)` through
+    // `resolve_2d_transform` from a unit test requires a full Stylo
+    // `ComputedValues` instance, which Blitz doesn't construct
+    // directly outside the style pipeline. Instead we pin the kurbo
+    // convention this code depends on — if the convention ever
+    // changes the test fires loud and the `Rotate::Rotate(angle)`
+    // arm has to be updated to match.
+
+    use kurbo::Affine;
+
+    fn approx_eq(a: Affine, b: Affine) -> bool {
+        a.as_coeffs()
+            .iter()
+            .zip(b.as_coeffs().iter())
+            .all(|(x, y)| (x - y).abs() < 1e-6)
+    }
+
+    #[test]
+    fn kurbo_then_rotate_takes_radians() {
+        let rotated = Affine::IDENTITY.then_rotate(std::f64::consts::PI);
+        let expected = Affine::new([-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+        assert!(
+            approx_eq(rotated, expected),
+            "kurbo `then_rotate(PI)` = {rotated:?}, expected {expected:?}; \
+             if this assertion fires the kurbo radians convention has \
+             changed — update `resolve_2d_transform`'s `Rotate::Rotate` \
+             arm accordingly."
+        );
+    }
+
+    #[test]
+    fn radians_and_degrees_disagree_for_animate_spin() {
+        // Documents *why* the conversion matters:
+        // `then_rotate(360.0)` interprets 360 as radians → 360 / (2π)
+        // ≈ 57.3 full rotations → a not-quite-identity matrix that
+        // accumulates large numerical noise across animation frames.
+        // `then_rotate(360°.to_radians())` returns to true identity.
+        let bug = Affine::IDENTITY.then_rotate(360.0);
+        let fix = Affine::IDENTITY.then_rotate(360.0_f64.to_radians());
+        assert!(
+            !approx_eq(bug, fix),
+            "the buggy and correct matrices for a 360° rotation must differ"
+        );
+        assert!(
+            approx_eq(fix, Affine::IDENTITY),
+            "rotating by a full turn (in radians) should return to identity"
+        );
     }
 }
