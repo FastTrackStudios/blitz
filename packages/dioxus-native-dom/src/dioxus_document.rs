@@ -68,6 +68,9 @@ pub struct DioxusDocument {
     pub inner: Rc<RefCell<BaseDocument>>,
     pub vdom: VirtualDom,
     pub vdom_state: DioxusState,
+    /// Focus / blur actions queued from `NodeHandle::set_focus`
+    /// futures. See `events::set_focus` for why this exists.
+    pub(crate) pending_focus: crate::events::PendingFocusActions,
 
     #[allow(unused)]
     pub(crate) html_element_id: NodeId,
@@ -135,6 +138,7 @@ impl DioxusDocument {
             vdom,
             vdom_state,
             inner: Rc::new(RefCell::new(doc)),
+            pending_focus: Rc::new(RefCell::new(Vec::new())),
             html_element_id,
             head_element_id,
             body_element_id,
@@ -198,6 +202,7 @@ impl DioxusDocument {
                     Rc::new(PlatformEventData::new(Box::new(NodeHandle {
                         doc: Rc::clone(&self.inner),
                         node_id,
+                        pending_focus: Rc::clone(&self.pending_focus),
                     }))) as Rc<dyn Any>,
                     false,
                 );
@@ -244,6 +249,7 @@ impl Document for DioxusDocument {
         drop(writer);
         drop(inner);
         self.flush_queued_mounted_events();
+        self.flush_pending_focus();
 
         true
     }
@@ -255,6 +261,28 @@ impl Document for DioxusDocument {
         };
         let mut driver = EventDriver::new(&mut self.inner, handler);
         driver.handle_ui_event(event);
+        self.flush_pending_focus();
+    }
+}
+
+impl DioxusDocument {
+    /// Drain any focus / blur actions queued from
+    /// `NodeHandle::set_focus` futures and apply them to the
+    /// document. Safe to call any time the caller is **not**
+    /// holding a borrow on `self.inner`.
+    pub(crate) fn flush_pending_focus(&mut self) {
+        let actions: Vec<_> = self.pending_focus.borrow_mut().drain(..).collect();
+        if actions.is_empty() {
+            return;
+        }
+        let mut doc = self.inner.borrow_mut();
+        for (node_id, focus) in actions {
+            if focus {
+                doc.set_focus_to(node_id);
+            } else if doc.get_focussed_node_id() == Some(node_id) {
+                doc.clear_focus();
+            }
+        }
     }
 }
 

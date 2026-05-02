@@ -132,10 +132,18 @@ impl HtmlEventConverter for NativeConverter {
     }
 }
 
+/// Pending focus / blur action queued from a `set_focus` future,
+/// drained by `DioxusDocument::poll` after the active event-dispatch
+/// borrow on the document has been released.
+///
+/// `bool` is `true` for focus, `false` for blur.
+pub type PendingFocusActions = Rc<RefCell<Vec<(NodeId, bool)>>>;
+
 #[derive(Clone)]
 pub struct NodeHandle {
     pub(crate) doc: Rc<RefCell<BaseDocument>>,
     pub(crate) node_id: NodeId,
+    pub(crate) pending_focus: PendingFocusActions,
 }
 
 impl NodeHandle {
@@ -240,26 +248,23 @@ impl RenderedElementBacking for NodeHandle {
     }
 
     fn set_focus(&self, focus: bool) -> Pin<Box<dyn Future<Output = MountedResult<()>>>> {
-        // Defer the document borrow into the returned future so that
-        // synchronous callers do not race with an active event-dispatch
-        // borrow on the same RefCell. dioxus-primitives, for example, calls
-        // `mounted.set_focus(true).await` from a `spawn`ed task; doing the
-        // borrow before returning the future panics if the caller is itself
-        // running inside a `borrow()` chain that has not yet been released.
-        let doc = Rc::clone(&self.doc);
-        let node_id = self.node_id;
-        Box::pin(async move {
-            let mut doc = doc.borrow_mut();
-            if focus {
-                // TODO: queue focus events somehow
-                doc.set_focus_to(node_id);
-            } else if doc.get_focussed_node_id() == Some(node_id) {
-                // Q: Should this only clear focus if the node is focussed?
-                // TODO: queue blur events somehow
-                doc.clear_focus();
-            }
-            Ok(())
-        })
+        // Queue the focus change for later instead of borrowing the
+        // document right now. dioxus-primitives (Dropdown, Select,
+        // Popover, …) calls `mounted.set_focus(true).await` from a
+        // `spawn`ed task that the Dioxus runtime polls inside its
+        // event-dispatch loop — at the very moment Blitz still holds
+        // a `borrow_mut` on the document for the same RefCell. Doing
+        // the focus mutation here (or even from inside a deferred
+        // future) panics with `RefCell already borrowed`, because
+        // the future is what's being polled inside that re-entrant
+        // window.
+        //
+        // `DioxusDocument::flush_pending_focus` drains this queue
+        // after every UI event and after every `poll`, both of
+        // which own the document mutable borrow themselves and so
+        // can safely apply the focus / blur.
+        self.pending_focus.borrow_mut().push((self.node_id, focus));
+        Box::pin(async { Ok(()) })
     }
 }
 
