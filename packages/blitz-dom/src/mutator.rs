@@ -296,6 +296,12 @@ impl DocumentMutator<'_> {
         // after the borrow ends.
         let refresh_focussable =
             matches!(name.local, local_name!("tabindex") | local_name!("disabled"));
+        // `autofocus` applied as a normal attribute mutation (dioxus builds
+        // the element then sets attrs — it never runs the HTML parser's
+        // node_to_autofocus path). Focus the node once it's in the document.
+        let do_autofocus = cfg!(feature = "autofocus")
+            && name.local == local_name!("autofocus")
+            && value != "false";
 
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
@@ -322,6 +328,11 @@ impl DocumentMutator<'_> {
             if let Some(el) = self.doc.nodes[node_id].element_data_mut() {
                 el.flush_is_focussable();
             }
+        }
+        // Must run after flush_is_focussable (set_focus_to no-ops on a
+        // non-focussable node) and after the element borrow ends.
+        if do_autofocus {
+            self.doc.set_focus_to(node_id);
         }
     }
 
