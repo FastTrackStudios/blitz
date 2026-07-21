@@ -25,6 +25,16 @@ pub(crate) fn draw_inline_backgrounds<'a>(
     inline_root_id: usize,
 ) {
     for line in lines {
+        // For a TRANSLUCENT background (a selection highlight) we fill the
+        // FULL line box — including the line-height leading — so adjacent
+        // selected lines meet with no white gap, like a browser selection.
+        // For an OPAQUE background (e.g. the reverse-video block caret) we
+        // keep the tight glyph ascent→descent box so the cursor hugs the
+        // character. `line.metrics().baseline` is the baseline offset from
+        // the line top; `line_height` is the full box. FTS.
+        let lm = line.metrics();
+        let line_top_from_baseline = lm.baseline as f64;
+        let line_height = lm.line_height as f64;
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
@@ -49,12 +59,20 @@ pub(crate) fn draw_inline_backgrounds<'a>(
                 continue;
             }
 
-            let metrics = glyph_run.run().metrics();
             let x = glyph_run.offset() as f64;
             let w = glyph_run.advance() as f64;
             let baseline = glyph_run.baseline() as f64;
-            let y0 = baseline - metrics.ascent as f64;
-            let y1 = baseline + metrics.descent as f64;
+            let translucent = bg_color.components[3] < 1.0;
+            let (y0, y1) = if translucent {
+                let top = baseline - line_top_from_baseline;
+                (top, top + line_height)
+            } else {
+                let metrics = glyph_run.run().metrics();
+                (
+                    baseline - metrics.ascent as f64,
+                    baseline + metrics.descent as f64,
+                )
+            };
             let rect = Rect::new(x, y0, x + w, y1);
 
             scene.fill(Fill::NonZero, transform, bg_color, None, &rect);
