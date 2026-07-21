@@ -482,16 +482,36 @@ pub(crate) fn handle_pointerdown(
 
                 drop(font_ctx);
             }
-
-            generate_focus_events(
-                doc,
-                &mut |doc| {
-                    doc.set_focus_to(hit.node_id);
-                },
-                dispatch_event,
-            );
         }
     }
+
+    // FTS: focus follows pointerdown for ALL content, not just text
+    // inputs — walk from the hit node to the nearest focussable
+    // ancestor (tabindex >= 0, inputs, links, ...) and focus it;
+    // clear focus when the click lands on non-focusable content.
+    // Upstream only focused text inputs here, which made
+    // contenteditable-style widgets (tabindex="0" divs, e.g. the FTS
+    // editor root) unfocusable by mouse. Matches browser behavior.
+    let focus_target = {
+        let mut cur = Some(hit.node_id);
+        while let Some(id) = cur {
+            if doc.nodes[id].is_focussable() {
+                break;
+            }
+            cur = doc.nodes[id].parent;
+        }
+        cur
+    };
+    generate_focus_events(
+        doc,
+        &mut |doc| match focus_target {
+            Some(id) => {
+                doc.set_focus_to(id);
+            }
+            None => doc.clear_focus(),
+        },
+        dispatch_event,
+    );
 }
 
 pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
