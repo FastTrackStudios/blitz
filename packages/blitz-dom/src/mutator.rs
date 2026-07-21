@@ -363,6 +363,13 @@ impl DocumentMutator<'_> {
             return;
         }
 
+        // FTS: `autofocus` applied as a normal attribute mutation to a node
+        // already in the document (upstream only honours it when the node is
+        // mounted). Focus the node once it's in the document.
+        let do_autofocus = cfg!(feature = "autofocus")
+            && name.local == local_name!("autofocus")
+            && value != "false";
+
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
         if !node.flags.is_in_document() {
@@ -389,6 +396,11 @@ impl DocumentMutator<'_> {
             || (tag, attr) == tag_and_attr!("iframe", "srcdoc")
         {
             self.load_iframe(node_id);
+        }
+        // Runs after the element borrow ends (and after the focusability
+        // flush above: set_focus_to no-ops on a non-focussable node).
+        if do_autofocus {
+            self.doc.set_focus_to(node_id);
         }
     }
 
