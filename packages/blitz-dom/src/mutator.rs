@@ -286,9 +286,25 @@ impl DocumentMutator<'_> {
             return;
         }
 
+        // FTS: `is_focussable` is computed once at element construction from
+        // the attrs present THEN. Toolkits that build elements empty and set
+        // attributes afterwards (dioxus-native-dom, and any incremental
+        // mutation path) would otherwise never make a `tabindex` element
+        // focussable. Re-flush when a focus-affecting attribute changes so
+        // click/tab/programmatic focus works on such elements. Computed from
+        // `name` (not the `element`-borrowed `attr`/`tag`) so it can run
+        // after the borrow ends.
+        let refresh_focussable =
+            matches!(name.local, local_name!("tabindex") | local_name!("disabled"));
+
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
         if !node.flags.is_in_document() {
+            if refresh_focussable {
+                if let Some(el) = node.element_data_mut() {
+                    el.flush_is_focussable();
+                }
+            }
             return;
         }
 
@@ -300,6 +316,12 @@ impl DocumentMutator<'_> {
             self.load_custom_paint_src(node_id);
         } else if (tag, attr) == tag_and_attr!("link", "href") {
             self.load_linked_stylesheet(node_id);
+        }
+
+        if refresh_focussable {
+            if let Some(el) = self.doc.nodes[node_id].element_data_mut() {
+                el.flush_is_focussable();
+            }
         }
     }
 

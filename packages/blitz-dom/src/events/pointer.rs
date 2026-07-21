@@ -598,6 +598,17 @@ pub(crate) fn handle_click(
                 break 'matched true;
             }
 
+            // FTS: a focussable element (tabindex >= 0 — e.g. a
+            // contenteditable-style editor root) counts as a match, so
+            // the "nothing matched -> clear focus" fallback below does
+            // NOT strip the focus that pointerdown just gave it. Without
+            // this, clicking such a widget focuses it on pointerdown and
+            // immediately blurs it on the click event, leaving keyboard
+            // input routed to the document root (dead keys).
+            if el.is_focussable {
+                break 'matched true;
+            }
+
             match el.name.local {
                 local_name!("input") if el.attr(local_name!("type")) == Some("checkbox") => {
                     let is_checked = BaseDocument::toggle_checkbox(el);
