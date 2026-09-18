@@ -907,6 +907,17 @@ impl Node {
         self.tree().get(id).unwrap()
     }
 
+    /// The node with this id, if it is still in the tree.
+    ///
+    /// `with` panics, which is right where the id came from the tree a
+    /// moment ago and wrong where it came from a list that outlived the
+    /// node it names. Hit testing is the second kind: `paint_children`
+    /// is rebuilt on resolve, and a pointer event that arrives between a
+    /// mutation and the next resolve walks ids whose nodes are gone.
+    pub fn try_with(&self, id: usize) -> Option<&Node> {
+        self.tree().get(id)
+    }
+
     pub fn print_tree(&self, level: usize) {
         println!(
             "{} {} {:?} {} {:?}",
@@ -1402,10 +1413,10 @@ impl Node {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    let Some(child) = self.try_with(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
@@ -1413,8 +1424,20 @@ impl Node {
         }
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
+        //
+        // Children that are no longer in the tree are skipped rather than
+        // unwrapped. `paint_children` is rebuilt on resolve, so a pointer
+        // event delivered between a mutation and the next resolve walks
+        // ids whose nodes have already gone — which is a stale list, not a
+        // broken tree, and hit testing against one should miss rather than
+        // abort the process. A UI that removes nodes while the pointer is
+        // over it does this constantly: virtualised lists, and anything
+        // that re-lays-out under a drag.
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            if let Some(hit) = self.with(*child_id).hit_inner(x, y, scale, scrollbar) {
+            let Some(child) = self.try_with(*child_id) else {
+                continue;
+            };
+            if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                 return Some(hit);
             }
         }
@@ -1425,10 +1448,10 @@ impl Node {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    let Some(child) = self.try_with(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
