@@ -309,11 +309,30 @@ impl Node {
     }
 
     /// Set appropriate damage for Stylo when an element's style attribute is updated
+    ///
+    /// The hint goes on this element, and the ANCESTORS are marked so the
+    /// style traversal reaches it — which is what every other mutation
+    /// path here does.
+    ///
+    /// It used to set `dirty_descendants` on itself, which says something
+    /// beneath me is dirty and makes the traversal walk this element's
+    /// whole subtree. For a style attribute that is almost always wrong:
+    /// a declaration changes the element's own computed style, and Stylo
+    /// already propagates to children when the change is one that
+    /// inherits. Setting it unconditionally means any inline style write
+    /// restyles everything under it.
+    ///
+    /// That is cheap on a button and ruinous on a container. A scrolling
+    /// view that moves its contents by writing one `transform` on a
+    /// wrapper — which is the standard way to scroll without re-rendering
+    /// — was restyling every node it wrapped, once per frame: measured at
+    /// 55ms of a 65ms frame with 1,700 nodes under the wrapper, against
+    /// 0.3ms on the frames that changed nothing.
     pub(crate) fn mark_style_attr_updated(&mut self) {
         if let Some(mut data) = self.stylo_element_data.get_mut() {
             data.hint |= RestyleHint::RESTYLE_STYLE_ATTRIBUTE;
         }
-        self.set_dirty_descendants();
+        self.mark_ancestors_dirty();
     }
 
     /// Marks all ancestors of this node as having dirty descendants.
