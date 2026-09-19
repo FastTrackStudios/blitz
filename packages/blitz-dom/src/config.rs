@@ -11,20 +11,31 @@ use style::media_queries::MediaType;
 /// Strategy for Stylo's style traversal during `resolve`.
 ///
 /// Two `Document`s resolving on [`StyleThreading::Parallel`] concurrently
-/// share Stylo's global thread pool and can panic with
+/// share Stylo's global thread pool and used to panic with
 /// `already mutably borrowed` — see
-/// <https://github.com/DioxusLabs/blitz/issues/430>. Set
-/// [`StyleThreading::Sequential`] on documents that may resolve from a
-/// user thread while another `Parallel` resolve is in flight.
+/// <https://github.com/DioxusLabs/blitz/issues/430>. That is why the
+/// default was quietly [`Sequential`](Self::Sequential) while the
+/// documentation here said otherwise, and it meant every document
+/// resolved its style on one thread: on a tree of a few thousand nodes
+/// that is most of a frame.
+///
+/// `Parallel` no longer has to be traded against that. A document takes
+/// the global pool only if no other document is using it, and otherwise
+/// traverses sequentially for that frame rather than panicking — so the
+/// fast path is the default and the slow path is a fallback instead of a
+/// decision the caller has to make correctly.
+///
+/// [`Sequential`](Self::Sequential) remains for a caller that wants the
+/// pool left alone entirely.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StyleThreading {
-    /// Use Stylo's parallel traversal via its global rayon thread pool.
-    /// Fastest for a single document; panics if another `Parallel` resolve
-    /// is in flight on a different thread.
-    Parallel,
-    /// Run style traversal sequentially on the calling thread, bypassing
-    /// the global pool. Safe to use from many user threads concurrently.
+    /// Use Stylo's parallel traversal via its global rayon thread pool,
+    /// falling back to a sequential traversal for any frame where
+    /// another document already holds it.
     #[default]
+    Parallel,
+    /// Always traverse sequentially on the calling thread, bypassing the
+    /// global pool.
     Sequential,
 }
 

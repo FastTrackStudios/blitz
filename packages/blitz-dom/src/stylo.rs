@@ -25,6 +25,14 @@ use style::color::AbsoluteColor;
 use style::data::{ElementDataMut, ElementDataRef};
 use style::dom::AttributeProvider;
 use style::global_style_data::STYLE_THREAD_POOL;
+
+/// Who is currently driving Stylo's global thread pool.
+///
+/// Held for the length of one document's parallel traversal. A second
+/// document that cannot take it traverses sequentially instead of
+/// sharing the pool, which is the crash in
+/// <https://github.com/DioxusLabs/blitz/issues/430>.
+static STYLE_POOL_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
 use style::properties::{Importance, PropertyDeclaration};
@@ -143,11 +151,25 @@ impl crate::document::BaseDocument {
         if token.should_traverse() {
             // Style the elements, resolving their data
             let traverser = RecalcStyle::new(context);
-            // `Sequential` bypasses Stylo's global pool. See `StyleThreading`.
-            let pool_guard = matches!(self.style_threading, StyleThreading::Parallel)
-                .then(|| STYLE_THREAD_POOL.pool());
+            // Stylo's thread pool is global, and two documents driving it
+            // at once is what issue #430 is: `already mutably borrowed`,
+            // from a shared borrow inside the pool rather than from
+            // anything either document did wrong.
+            //
+            // So a document CLAIMS the pool rather than assuming it. One
+            // gets the parallel traversal; anyone who arrives while it is
+            // held traverses sequentially for that frame, which is slower
+            // and correct. That is what lets `Parallel` be the default —
+            // the alternative was every document paying single-threaded
+            // style for a hazard almost none of them are in.
+            let claim = matches!(self.style_threading, StyleThreading::Parallel)
+                .then(|| STYLE_POOL_CLAIM.try_lock().ok())
+                .flatten();
+            let pool_guard = claim.is_some().then(|| STYLE_THREAD_POOL.pool());
             let rayon_pool = pool_guard.as_ref().and_then(|g| g.as_ref());
             style::driver::traverse_dom(&traverser, token, rayon_pool);
+            drop(pool_guard);
+            drop(claim);
         }
 
         for opaque in self.snapshots.keys() {
