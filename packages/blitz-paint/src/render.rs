@@ -910,8 +910,15 @@ impl ElementCx<'_, '_> {
             return;
         };
 
-        let width = self.frame.content_box.width() as u32;
-        let height = self.frame.content_box.height() as u32;
+        // The content box as it IS, not truncated to whole pixels. It
+        // used to be cast through `u32` on the way to the object-fit
+        // arithmetic, so an element 100.7 wide scaled its drawing to 100
+        // and every SVG in a page was squeezed by whatever its own box's
+        // fraction happened to be — a sub-pixel error, but a different
+        // one per element and therefore visible as a general softness
+        // against a renderer that does not do it.
+        let width = self.frame.content_box.width();
+        let height = self.frame.content_box.height();
         let svg_size = svg.size();
 
         let x = self.frame.content_box.origin().x;
@@ -930,6 +937,7 @@ impl ElementCx<'_, '_> {
             width: width as f32,
             height: height as f32,
         };
+        debug_assert!(container_size.width.is_finite());
         let object_size = taffy::Size {
             width: svg_size.width(),
             height: svg_size.height(),
