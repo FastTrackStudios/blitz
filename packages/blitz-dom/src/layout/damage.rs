@@ -522,17 +522,35 @@ impl BaseDocument {
         node_id: usize,
         parent_stacking_context: Option<&mut HoistedPaintChildren>,
     ) {
+        let incremental = self.incremental_layout;
+
+        // Whether this node's own style is worth converting again.
+        //
+        // The walk still visits everything, because the ordering work
+        // below depends on children this node cannot see the damage of.
+        // What it skips is the expensive part: a full Taffy style
+        // conversion and two image-layer scans, for a node whose style
+        // has not moved. On an arrangement of ten thousand nodes with
+        // one changed transform that was the largest phase in the
+        // frame — 2.5ms of re-deriving styles that were already right.
+        let restyled = !incremental
+            || self
+                .nodes
+                .get(node_id)
+                .and_then(|node| node.damage())
+                .is_none_or(|damage| !damage.is_empty());
+
         let mut new_stacking_context: HoistedPaintChildren = HoistedPaintChildren::new();
         let stacking_context = &mut new_stacking_context;
 
-        // Flush background/mask images from style to dedicated storage on the node
-        self.flush_image_layers_from_style(node_id, ImageLayerKind::Background);
-        self.flush_image_layers_from_style(node_id, ImageLayerKind::Mask);
+        if restyled {
+            // Flush background/mask images from style to dedicated storage on the node
+            self.flush_image_layers_from_style(node_id, ImageLayerKind::Background);
+            self.flush_image_layers_from_style(node_id, ImageLayerKind::Mask);
+        }
 
-        let incremental = self.incremental_layout;
         let display = {
             let node = self.nodes.get_mut(node_id).unwrap();
-            let _damage = node.damage().unwrap_or(ALL_DAMAGE);
             let stylo_element_data = node.stylo_element_data.get();
             let primary_styles = stylo_element_data
                 .as_ref()
@@ -542,10 +560,10 @@ impl BaseDocument {
                 return;
             };
 
-            // if damage.intersects(RestyleDamage::RELAYOUT | CONSTRUCT_BOX) {
-            node.style = stylo_taffy::to_taffy_style(style);
-            node.display_constructed_as = style.clone_display();
-            // }
+            if restyled {
+                node.style = stylo_taffy::to_taffy_style(style);
+                node.display_constructed_as = style.clone_display();
+            }
 
             // In non-incremental mode we unconditionally clear the Taffy cache.
             // In incremental mode this is handled as part of damage propagation.
