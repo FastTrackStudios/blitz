@@ -373,6 +373,13 @@ impl BaseDocument {
         // println!("\n\nRESOLVE LAYOUT\n===========\n");
 
         taffy::compute_root_layout(self, root_element_id, available_space);
+        // Rounding walks the whole tree and is 6% of a frame on a big
+        // one, but it cannot be skipped on the grounds that nothing was
+        // damaged: `compute_root_layout` rewrites unrounded layouts for
+        // anything its cache missed, and `final_layout` is only ever
+        // written here. Skipping it left the window laying out at zero
+        // size. Making this incremental means teaching Taffy to report
+        // which nodes it actually recomputed.
         taffy::round_layout(self, root_element_id);
 
         // println!("\n\n");
