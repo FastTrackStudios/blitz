@@ -27,11 +27,15 @@ use style::color::AbsoluteColor;
 use style::data::{ElementDataMut, ElementDataRef};
 use style::global_style_data::STYLE_THREAD_POOL;
 
-/// Serialises `Parallel` style traversals across documents. Stylo's per-worker
-/// caches (`StyleSharingCache`, `StyleBloom`) live in native thread-locals that
-/// a traversal borrows mutably for its whole duration, so two traversals in
-/// flight on the shared pool at once panic with `already mutably borrowed`
+/// Who is currently driving Stylo's global thread pool. Stylo's per-worker
+/// caches (`StyleSharingCache`, `StyleBloom`) live in native thread-locals
+/// that a traversal borrows mutably for its whole duration, so two traversals
+/// in flight on the shared pool at once panic with `already mutably borrowed`
 /// (<https://github.com/DioxusLabs/blitz/issues/430>).
+///
+/// FTS: held for the length of one document's parallel traversal. A second
+/// document that cannot take it traverses sequentially instead of waiting
+/// for the pool (or sharing it).
 static PARALLEL_TRAVERSAL_LOCK: Mutex<()> = Mutex::new(());
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
@@ -153,16 +157,29 @@ impl crate::document::BaseDocument {
         if token.should_traverse() {
             // Style the elements, resolving their data
             let mut traverser = RecalcStyle::new(context);
-            // `Sequential` bypasses Stylo's global pool. See `StyleThreading`.
-            let parallel = matches!(self.style_threading, StyleThreading::Parallel);
-            let _traversal_lock = parallel.then(|| {
-                PARALLEL_TRAVERSAL_LOCK
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-            });
-            let pool_guard = parallel.then(|| STYLE_THREAD_POOL.pool());
+            // Stylo's thread pool is global, and two documents driving it
+            // at once is what issue #430 is: `already mutably borrowed`,
+            // from a shared borrow inside the pool rather than from
+            // anything either document did wrong.
+            //
+            // So a document CLAIMS the pool rather than assuming it. One
+            // gets the parallel traversal; anyone who arrives while it is
+            // held traverses sequentially for that frame, which is slower
+            // and correct. That is what lets `Parallel` be the default —
+            // the alternative was every document paying single-threaded
+            // style for a hazard almost none of them are in.
+            let claim = matches!(self.style_threading, StyleThreading::Parallel)
+                .then(|| match PARALLEL_TRAVERSAL_LOCK.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                })
+                .flatten();
+            let pool_guard = claim.is_some().then(|| STYLE_THREAD_POOL.pool());
             let rayon_pool = pool_guard.as_ref().and_then(|g| g.as_ref());
             style::driver::traverse_dom(&traverser, token, rayon_pool);
+            drop(pool_guard);
+            drop(claim);
             nodes_needing_style_image_flush =
                 std::mem::take(traverser.nodes_needing_style_image_flush.get_mut().unwrap());
         }

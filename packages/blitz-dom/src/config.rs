@@ -10,19 +10,32 @@ use style::media_queries::MediaType;
 
 /// Strategy for Stylo's style traversal during `resolve`.
 ///
-/// `Parallel` traversals are serialised process-wide (Stylo's global pool can
-/// only run one traversal at a time), so documents resolving from several
-/// threads never run their style traversals concurrently but also never
-/// overlap: it only pays off when a single thread resolves all documents
-/// (e.g. a UI thread, including nested sub-documents).
+/// Two `Document`s resolving on [`StyleThreading::Parallel`] concurrently
+/// share Stylo's global thread pool and used to panic with
+/// `already mutably borrowed` — see
+/// <https://github.com/DioxusLabs/blitz/issues/430>. That is why the
+/// default was quietly [`Sequential`](Self::Sequential) while the
+/// documentation here said otherwise, and it meant every document
+/// resolved its style on one thread: on a tree of a few thousand nodes
+/// that is most of a frame.
+///
+/// `Parallel` no longer has to be traded against that. A document takes
+/// the global pool only if no other document is using it, and otherwise
+/// traverses sequentially for that frame rather than panicking — so the
+/// fast path is the default and the slow path is a fallback instead of a
+/// decision the caller has to make correctly.
+///
+/// [`Sequential`](Self::Sequential) remains for a caller that wants the
+/// pool left alone entirely.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StyleThreading {
-    /// Use Stylo's parallel traversal via its global rayon thread pool.
-    Parallel,
-    /// Run style traversal sequentially on the calling thread, bypassing
-    /// the global pool and its lock. Threads resolving their own documents
-    /// run independently of each other.
+    /// Use Stylo's parallel traversal via its global rayon thread pool,
+    /// falling back to a sequential traversal for any frame where
+    /// another document already holds it.
     #[default]
+    Parallel,
+    /// Always traverse sequentially on the calling thread, bypassing the
+    /// global pool.
     Sequential,
 }
 
@@ -51,7 +64,7 @@ pub struct DocumentConfig {
     /// Defaults to [`MediaType::screen`].
     pub media_type: Option<MediaType>,
     /// Strategy for Stylo's style traversal.
-    /// Defaults to [`StyleThreading::Sequential`].
+    /// Defaults to [`StyleThreading::Parallel`].
     pub style_threading: StyleThreading,
     /// Whether incremental layout is enabled. Defaults to `true`.
     ///

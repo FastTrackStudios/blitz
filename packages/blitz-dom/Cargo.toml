@@ -11,7 +11,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-default = [
+default = ["log-phase-times", 
     "svg",
     "woff",
     "accessibility",
