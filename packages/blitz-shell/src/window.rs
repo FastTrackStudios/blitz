@@ -413,14 +413,22 @@ impl<Rend: WindowRenderer> View<Rend> {
                 encoded = at.elapsed();
             });
             let whole = started.elapsed();
-            if whole > std::time::Duration::from_millis(4) {
-                println!(
-                    "Paint: {:.1}ms (encode: {:.1}ms, present: {:.1}ms)",
-                    whole.as_secs_f64() * 1000.0,
-                    encoded.as_secs_f64() * 1000.0,
-                    (whole - encoded).as_secs_f64() * 1000.0
-                );
-            }
+            // Recorded, not printed: a println on the render path costs
+            // more than the frames it is measuring, and only says
+            // anything to whoever is watching the terminal. The
+            // application reads these beside `LAST_FRAME_MICROS` and can
+            // draw them into the frame they describe.
+            let micros = |d: std::time::Duration| {
+                u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+            };
+            blitz_traits::LAST_ENCODE_MICROS.store(
+                micros(encoded),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            blitz_traits::LAST_PRESENT_MICROS.store(
+                micros(whole.saturating_sub(encoded)),
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         drop(inner);

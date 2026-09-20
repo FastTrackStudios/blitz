@@ -16,7 +16,7 @@ use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
-use anyrender::{PaintScene, Scene};
+use anyrender::PaintScene;
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextNodeData,
