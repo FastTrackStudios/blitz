@@ -1080,10 +1080,21 @@ impl Node {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    // A hoisted child that has left the tree is skipped, not
+                    // unwrapped.
+                    //
+                    // The stacking context is built during layout and holds
+                    // node ids. Remove a positioned child — a popup closing, a
+                    // modal dismissed — and hit-test before the next layout,
+                    // and the id is dangling: `with()` unwraps `None` and takes
+                    // the window down. The panic arrives on a pointer move,
+                    // far from whatever removed the node, and reads as a bug in
+                    // whichever component happened to be on screen. There is
+                    // nothing to hit at a node that does not exist.
+                    let Some(node) = self.tree().get(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = node.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
@@ -1103,10 +1114,11 @@ impl Node {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self
-                        .with(hoisted_child.node_id)
-                        .hit_inner(x, y, scale, scrollbar)
-                    {
+                    // Skipped, not unwrapped — see the positive-z loop above.
+                    let Some(node) = self.tree().get(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = node.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
