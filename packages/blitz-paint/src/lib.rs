@@ -14,6 +14,7 @@ mod render;
 mod sizing;
 mod text;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyrender::{PaintScene, Scene};
@@ -30,7 +31,13 @@ const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
 const SELECTION_COLOR: Color = Color::from_rgb8(180, 213, 255);
 
 /// Pre-computed `Scene`s for each CustomWidget, keyed by `(document id, node id)`
-type CustomWidgetSceneMap = HashMap<(usize, NodeId), Scene>;
+///
+/// FTS: behind a `RefCell` so the walk can TAKE a widget's scene rather
+/// than clone it. A deep copy of every path a widget drew, every frame,
+/// was the single largest cost in painting an arrangement — and it buys
+/// nothing, because the map is thrown away at the end of the frame and
+/// no node is painted twice.
+type CustomWidgetSceneMap = RefCell<HashMap<(usize, NodeId), Scene>>;
 
 /// Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into
 /// an impl [`anyrender::PaintScene`].
@@ -55,9 +62,9 @@ pub fn paint_scene(
     //
     // TODO: Take widget and sub-document visibility into account
     #[allow(unused_mut)]
-    let mut custom_widget_scenes: CustomWidgetSceneMap = HashMap::new();
+    let custom_widget_scenes: CustomWidgetSceneMap = RefCell::new(HashMap::new());
     #[cfg(feature = "custom-widget")]
-    build_custom_widget_scenes(&mut custom_widget_scenes, doc, scene, scale);
+    build_custom_widget_scenes(&mut custom_widget_scenes.borrow_mut(), doc, scene, scale);
 
     let generator = BlitzDomPainter::new(
         doc,
@@ -80,7 +87,7 @@ pub fn paint_scene(
 
 #[cfg(feature = "custom-widget")]
 fn build_custom_widget_scenes(
-    custom_widget_scenes: &mut CustomWidgetSceneMap,
+    custom_widget_scenes: &mut HashMap<(usize, NodeId), Scene>,
     doc: &mut BaseDocument,
     render_ctx: &mut impl anyrender::RenderContext,
     scale: f64,
