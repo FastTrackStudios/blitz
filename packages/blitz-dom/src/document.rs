@@ -795,6 +795,23 @@ impl BaseDocument {
     pub(crate) fn drop_node_ignoring_parent(&mut self, node_id: usize) -> Option<Node> {
         let mut node = self.nodes.try_remove(node_id);
         if let Some(node) = &mut node {
+            // The document remembers a handful of node ids across events —
+            // what the pointer is over, what it went down on, what is focussed
+            // and what is active. Nothing renews them when the node they name
+            // is removed, so a subtree that rebuilds mid-interaction leaves
+            // them pointing at a slab slot that is gone, and the next event
+            // that reads one panics with `invalid key`. The panic lands on a
+            // pointer move or a keystroke, far from the mutation that caused
+            // it, which is why it reads as a bug in whichever component
+            // happened to be on screen.
+            //
+            // Forgetting them here is the only place that scales: this is the
+            // single point where a node actually leaves the slab, and every
+            // guard added at a read site is one more site to remember next
+            // time. A cleared id means "nothing is hovered / focussed" for one
+            // event, which is the truth — the node is gone.
+            self.forget_node(node_id);
+
             if let Some(before) = node.before {
                 self.drop_node_ignoring_parent(before);
             }
@@ -807,6 +824,24 @@ impl BaseDocument {
             }
         }
         node
+    }
+
+    /// Drop every remembered reference to a node that no longer exists.
+    ///
+    /// See [`BaseDocument::drop_node_ignoring_parent`], its only caller, for
+    /// why this is centralised rather than guarded at each read.
+    fn forget_node(&mut self, node_id: usize) {
+        for slot in [
+            &mut self.hover_node_id,
+            &mut self.focus_node_id,
+            &mut self.active_node_id,
+            &mut self.mousedown_node_id,
+        ] {
+            if *slot == Some(node_id) {
+                *slot = None;
+            }
+        }
+        self.changed_nodes.remove(&node_id);
     }
 
     /// Whether the document has been mutated

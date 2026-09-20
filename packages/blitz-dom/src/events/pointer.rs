@@ -171,15 +171,27 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
         if dx.abs() > 2.0 || dy.abs() > 2.0 {
             match event.id {
                 BlitzPointerId::Mouse | BlitzPointerId::Pen => {
-                    if let Some(mousedown_node_id) = doc.mousedown_node_id {
-                        let node = &doc.nodes[mousedown_node_id];
+                    // `mousedown_node_id` is remembered from a previous
+                    // event, so by the time the pointer moves the node it
+                    // names may be gone: anything that re-renders between the
+                    // press and the drag replaces it, and a custom widget
+                    // that rebuilds its subtree while being dragged does
+                    // exactly that. Indexing the slab with the stale id
+                    // panics with `invalid key`, on a pointer move, far from
+                    // whatever removed the node — so it reads as a bug in
+                    // whichever component is on screen. There is no selection
+                    // to start from a node that no longer exists.
+                    if let Some(mousedown_node_id) = doc.mousedown_node_id
+                        && let Some(node) = doc.nodes.get(mousedown_node_id)
+                    {
                         if let Some(style) = node.primary_styles() {
                             let user_select = style.clone_user_select();
                             if user_select == UserSelect::None {
                                 // Do nothing. Continue with rest of function
                             } else if user_select == UserSelect::Auto {
-                                if let Some(parent) = node.parent {
-                                    let node = &doc.nodes[parent];
+                                if let Some(parent) = node.parent
+                                    && let Some(node) = doc.nodes.get(parent)
+                                {
                                     if let Some(style) = node.primary_styles() {
                                         let user_select = style.clone_user_select();
                                         if user_select == UserSelect::None {
