@@ -155,14 +155,14 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
         let viewport_scroll = Point { x: 0.0, y: 0.0 };
         let ui_event = map_dom_event_to_ui_event(event, pos, viewport_scroll);
 
-        // FTS: the widget says whether the event changed its picture.
-        // Nothing else in the document can know, so without asking, a
-        // hover or a click inside a widget updates state that is never
-        // drawn.
-        let repaint = ui_event
-            .map(|ui_event| widget_data.widget.handle_event(&ui_event))
-            .unwrap_or(false);
-        if repaint {
+        // FTS: the widget is asked whether the event changed its
+        // picture. Nothing else in the document can know, so without
+        // asking, a hover or a click inside a widget updates state that
+        // is never drawn.
+        if let Some(ui_event) = ui_event {
+            widget_data.widget.handle_event(&ui_event);
+        }
+        if widget_data.widget.needs_redraw() {
             doc.shell_provider.request_redraw();
         }
 

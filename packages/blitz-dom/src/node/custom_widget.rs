@@ -97,14 +97,24 @@ pub trait Widget {
     // Other
 
     /// Handle input events (mouse, keyboard, etc)
-    ///
-    /// FTS: returns whether the widget needs repainting as a result.
-    /// Nothing else in the document knows — a widget's contents are its
-    /// own — so without an answer here a hover or a click inside a
-    /// widget changes state that nothing ever draws. The default is
-    /// `false`, which is what a widget that ignores the event means.
-    fn handle_event(&mut self, event: &UiEvent) -> bool {
+    fn handle_event(&mut self, event: &UiEvent) {
         let _ = event;
+    }
+
+    /// Whether the widget's picture changed and it must be painted
+    /// again.
+    ///
+    /// FTS: asked right after [`Widget::handle_event`]. Nothing else in
+    /// the document can know — a widget's contents are its own — so
+    /// without asking, a hover or a click inside a widget updates state
+    /// that is never drawn.
+    ///
+    /// A separate method rather than a return value on `handle_event`,
+    /// deliberately: a widget written against a blitz that does not ask
+    /// still compiles, and one written against a blitz that does still
+    /// works if the question is never put. The default is `false`,
+    /// which is what a widget that ignores its events means.
+    fn needs_redraw(&self) -> bool {
         false
     }
 
