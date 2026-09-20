@@ -1103,7 +1103,12 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            if let Some(hit) = self.with(*child_id).hit_inner(x, y, scale, scrollbar) {
+            // Skipped, not unwrapped — `paint_children` is filled during
+            // layout and goes stale the same way the hoisted lists do.
+            let Some(child) = self.tree().get(*child_id) else {
+                continue;
+            };
+            if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                 return Some(hit);
             }
         }
@@ -1137,9 +1142,14 @@ impl Node {
                 {
                     let style_index = cluster.glyphs().next()?.style_index();
                     let node_id = layout.styles()[style_index].brush.id;
+                    // Same again: the inline layout's brush ids are captured
+                    // when it is built, and a node can leave the tree before
+                    // the next one. A run whose node is gone is not one the
+                    // pointer can be over.
                     let text_pointer_events_none = self
-                        .with(node_id)
-                        .primary_styles()
+                        .tree()
+                        .get(node_id)
+                        .and_then(super::Node::primary_styles)
                         .is_some_and(|style| style.clone_pointer_events() == PointerEvents::None);
                     if !text_pointer_events_none {
                         return Some(HitResult {
