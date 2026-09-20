@@ -314,7 +314,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         }
 
         #[cfg(feature = "custom-widget")]
-        let custom_widget_scene = self.custom_widget_scenes.get(&(self.dom.id(), node_id));
+        // FTS: the KEY, not the scene. Taken out of the map at the
+        // point it is drawn, so a widget's paths are moved into the
+        // frame rather than copied into it.
+        let custom_widget_scene = Some((self.dom.id(), node_id))
+            .filter(|key| self.custom_widget_scenes.borrow().contains_key(key));
         #[cfg(not(feature = "custom-widget"))]
         let custom_widget_scene = None;
 
@@ -491,7 +495,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         node: &'dom Node,
         layout: Layout,
         transform: Affine,
-        custom_widget_scene: Option<&'a Scene>,
+        custom_widget_scene: Option<(usize, usize)>,
     ) -> ElementCx<'dom, 'a> {
         let style = node
             .stylo_element_data
@@ -571,7 +575,7 @@ struct ElementCx<'dom, 'a> {
     list_item: Option<&'dom ListItemLayout>,
     devtools: &'dom DevtoolSettings,
     #[cfg_attr(not(feature = "custom-widget"), expect(unused))]
-    custom_widget_scene: Option<&'a Scene>,
+    custom_widget_scene: Option<(usize, usize)>,
 }
 
 /// Converts parley BoundingBox into peniko Rect
@@ -1011,13 +1015,18 @@ impl ElementCx<'_, '_> {
 
     #[cfg(feature = "custom-widget")]
     fn draw_custom_widget(&self, scene: &mut impl PaintScene) {
-        if let Some(widget_scene) = self.custom_widget_scene {
+        if let Some(key) = self.custom_widget_scene
+            && let Some(widget_scene) = self.custom_widget_scenes.borrow_mut().remove(&key)
+        {
             let x = self.frame.content_box.origin().x;
             let y = self.frame.content_box.origin().y;
             let transform = self.transform.then_translate(Vec2 { x, y });
 
-            // TODO: eliminate clone
-            scene.append_scene(widget_scene.clone(), transform);
+            // FTS: moved, not cloned. `append_scene` takes the scene by
+            // value and the map is this frame's alone, so removing is
+            // the whole of the fix for the `eliminate clone` that used
+            // to be here.
+            scene.append_scene(widget_scene, transform);
         }
     }
 
