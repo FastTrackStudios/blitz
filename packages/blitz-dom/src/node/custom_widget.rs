@@ -97,8 +97,15 @@ pub trait Widget {
     // Other
 
     /// Handle input events (mouse, keyboard, etc)
-    fn handle_event(&mut self, event: &UiEvent) {
+    ///
+    /// FTS: returns whether the widget needs repainting as a result.
+    /// Nothing else in the document knows — a widget's contents are its
+    /// own — so without an answer here a hover or a click inside a
+    /// widget changes state that nothing ever draws. The default is
+    /// `false`, which is what a widget that ignores the event means.
+    fn handle_event(&mut self, event: &UiEvent) -> bool {
         let _ = event;
+        false
     }
 
     /// Callback for the widget to paint it's content.

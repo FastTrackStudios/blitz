@@ -5,8 +5,14 @@ use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
 use bitflags::bitflags;
-use keyboard_types::{Code, Key, Location, Modifiers};
 use smol_str::SmolStr;
+
+// FTS: re-exported, not just imported, because the event structs below
+// are `pub` with `pub` fields of these types, and a crate implementing
+// `Widget` cannot name them otherwise — it would have to guess which
+// `keyboard_types` in the graph is the right one, and there is more
+// than one.
+pub use keyboard_types::{Code, Key, Location, Modifiers};
 
 #[derive(Default)]
 pub struct EventState {

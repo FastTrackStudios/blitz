@@ -372,6 +372,7 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 
     pub fn redraw(&mut self) {
+        let frame_started = std::time::Instant::now();
         #[cfg(target_os = "ios")]
         self.ios_request_redraw.set(false);
         let animation_time = self.current_animation_time();
@@ -393,7 +394,13 @@ impl<Rend: WindowRenderer> View<Rend> {
         let insets = self.safe_area_insets.to_logical(scale);
 
         if !is_blocked && is_visible {
+            // FTS: paint and present, timed apart from `resolve`, which
+            // has a phase timer of its own. Without this the two are one
+            // number and a slow frame says nothing about which half.
+            let started = std::time::Instant::now();
+            let mut encoded = std::time::Duration::ZERO;
             self.renderer.render(|scene| {
+                let at = std::time::Instant::now();
                 paint_scene(
                     scene,
                     &mut inner,
@@ -402,13 +409,34 @@ impl<Rend: WindowRenderer> View<Rend> {
                     height,
                     insets.left,
                     insets.top,
-                )
+                );
+                encoded = at.elapsed();
             });
+            let whole = started.elapsed();
+            if whole > std::time::Duration::from_millis(4) {
+                println!(
+                    "Paint: {:.1}ms (encode: {:.1}ms, present: {:.1}ms)",
+                    whole.as_secs_f64() * 1000.0,
+                    encoded.as_secs_f64() * 1000.0,
+                    (whole - encoded).as_secs_f64() * 1000.0
+                );
+            }
         }
 
         drop(inner);
 
-        if !is_blocked && is_visible && is_animating {
+        blitz_traits::LAST_FRAME_MICROS.store(
+            u64::try_from(frame_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+
+        // FTS: `FTS_FORCE_REDRAW=1` keeps asking for the next frame
+        // whether or not the document thinks it is animating, which is
+        // what makes a window measurable: a render loop that runs at the
+        // machine's own pace, rather than one that only advances when
+        // somebody moves a mouse over it.
+        let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
+        if !is_blocked && is_visible && (is_animating || forced) {
             self.request_redraw();
         }
     }
