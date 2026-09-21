@@ -118,12 +118,16 @@ impl Node {
         const INDENT: &str = "  ";
         let style = opts.style;
         let has_children = !self.children.is_empty();
+        // FTS: legacy sRGB, not the colour's own space. A theme written in
+        // `oklch()` (Tailwind v4's default palette) serialises as
+        // `oklch(...)`, which usvg cannot parse — every `currentColor` icon
+        // under a class colour then drew black. `rgb()` it always reads.
         let current_color = opts
             .resolve_current_color
             .then(|| self.primary_styles())
             .flatten()
             .map(|style| style.clone_color())
-            .map(|color| color.to_css_string());
+            .map(|color| color.into_srgb_legacy().to_css_string());
 
         match &self.data {
             NodeData::Document(_) => {}
