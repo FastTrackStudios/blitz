@@ -560,9 +560,17 @@ impl BaseDocument {
                 return;
             };
 
-            if restyled {
+            // FTS: also re-convert when the computed values were *replaced*,
+            // damage or not. `node.style` holds raw pointers into them (every
+            // `calc()` length), and a damage-free restyle still frees the old
+            // ones — skipping here left Taffy dereferencing freed memory
+            // (SIGSEGV in `CalcNode::resolve_internal` when a surface swapped
+            // a batch of Tailwind `calc(var(--spacing) * n)` classes).
+            let source = &**style as *const _ as usize;
+            if restyled || node.style_source != source {
                 node.style = stylo_taffy::to_taffy_style(style);
                 node.display_constructed_as = style.clone_display();
+                node.style_source = source;
             }
 
             // In non-incremental mode we unconditionally clear the Taffy cache.

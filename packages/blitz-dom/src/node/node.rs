@@ -129,6 +129,15 @@ pub struct Node {
 
     // Taffy layout data:
     pub style: Style<Atom>,
+    /// Address of the Stylo computed values `style` was converted from.
+    ///
+    /// `style` is not self-contained: a `calc()` length is a raw pointer
+    /// *into* those computed values (`stylo_taffy::length_percentage`). A
+    /// restyle can swap in new computed values without producing damage (the
+    /// new values compare equal), freeing the old ones — so "no damage" alone
+    /// does not mean `style` is still safe to lay out with. The flush compares
+    /// this address and re-converts when it moved. `0` = never converted.
+    pub(crate) style_source: usize,
     pub display_constructed_as: StyloDisplay,
     pub cache: Cache,
     pub unrounded_layout: Layout,
@@ -188,6 +197,7 @@ impl Node {
             after: None,
 
             style: Default::default(),
+            style_source: 0,
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             dirty_descendants: AtomicBool::new(true),
