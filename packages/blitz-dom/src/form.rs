@@ -34,7 +34,11 @@ impl BaseDocument {
     ///
     /// <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>
     pub fn reset_form_owner(&mut self, node_id: usize) {
-        let node = &self.nodes[node_id];
+        // FTS: tolerate a node dropped since it was queued — resetting the
+        // owner of a node that no longer exists is a no-op, not a panic.
+        let Some(node) = self.get_node(node_id) else {
+            return;
+        };
         let Some(element) = node.element_data() else {
             return;
         };

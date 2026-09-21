@@ -717,6 +717,17 @@ impl<'doc> DocumentMutator<'doc> {
 
     fn process_removed_subtree(&mut self, node_id: usize) {
         self.doc.iter_subtree_mut(node_id, |node_id, doc| {
+            // FTS: a node added and removed within one mutation batch is still
+            // queued for `flush`. Once it is dropped its id is dead, and
+            // `flush` indexing it panics ("invalid key" in
+            // `reset_form_owner`) — seen at app start, when the first renders
+            // replace whole subtrees holding buttons/inputs. Forget it here.
+            self.form_nodes.remove(&node_id);
+            self.style_nodes.remove(&node_id);
+            if self.title_node == Some(node_id) {
+                self.title_node = None;
+            }
+
             let node = &mut doc.nodes[node_id];
             node.flags.set(NodeFlags::IS_IN_DOCUMENT, false);
 
