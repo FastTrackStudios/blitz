@@ -821,10 +821,14 @@ impl Node {
     fn write_outer_html_in_style(&self, writer: &mut String, style: OutputStyle, nesting: usize) {
         const INDENT: &str = "  ";
         let has_children = !self.children.is_empty();
+        // FTS: legacy sRGB, not the colour's own space. A theme written in
+        // `oklch()` (Tailwind v4's default palette) serialises as
+        // `oklch(...)`, which usvg cannot parse — every `currentColor` icon
+        // under a class colour then drew black. `rgb()` it always reads.
         let current_color = self
             .primary_styles()
             .map(|style| style.clone_color())
-            .map(|color| color.to_css_string());
+            .map(|color| color.into_srgb_legacy().to_css_string());
 
         match &self.data {
             NodeData::Document => {}
