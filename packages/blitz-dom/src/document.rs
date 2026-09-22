@@ -828,9 +828,17 @@ impl BaseDocument {
 
     /// Drop every remembered reference to a node that no longer exists.
     ///
-    /// See [`BaseDocument::drop_node_ignoring_parent`], its only caller, for
-    /// why this is centralised rather than guarded at each read.
-    fn forget_node(&mut self, node_id: usize) {
+    /// Not just `drop_node_ignoring_parent`'s caller: a pseudo-element node
+    /// (`::before`/`::after`) is also freed on its own, whenever a restyle
+    /// removes its generated content (`remove_and_drop_pe`, in
+    /// `layout::construct`), bypassing this document's other removal paths
+    /// entirely. That left `hover_node_id` et al. pointing at a freed slab
+    /// slot exactly as the comment above describes, just reached from a
+    /// pseudo-element's removal instead of an ordinary node's — the panic
+    /// then lands on the next hover/active ancestor walk
+    /// (`node_layout_ancestors`), far from a `::before`/`::after` in sight.
+    /// `pub(crate)` so both removal paths share the one place this is done.
+    pub(crate) fn forget_node(&mut self, node_id: usize) {
         for slot in [
             &mut self.hover_node_id,
             &mut self.focus_node_id,
@@ -842,6 +850,16 @@ impl BaseDocument {
             }
         }
         self.changed_nodes.remove(&node_id);
+
+        // A live text-selection endpoint can also name this node — see the
+        // matching comment in `mutator::process_removed_subtree`, which
+        // covers ordinary removal; this covers a pseudo-element's.
+        if self.text_selection.anchor.node_or_parent == Some(node_id) {
+            self.text_selection.anchor.clear();
+        }
+        if self.text_selection.focus.node_or_parent == Some(node_id) {
+            self.text_selection.focus.clear();
+        }
     }
 
     /// Whether the document has been mutated
@@ -893,6 +911,11 @@ impl BaseDocument {
         fn remove_pe_ignoring_parent(doc: &mut BaseDocument, node_id: usize) -> Option<Node> {
             let mut node = doc.nodes.try_remove(node_id);
             if let Some(node) = &mut node {
+                // This path frees the slab slot directly, same as
+                // `drop_node_ignoring_parent` — forget it the same way, or a
+                // hovered/active/focused/selected `::before`/`::after` leaves
+                // a dangling id (see `forget_node`'s doc comment).
+                doc.forget_node(node_id);
                 for &child in &node.children {
                     remove_pe_ignoring_parent(doc, child);
                 }

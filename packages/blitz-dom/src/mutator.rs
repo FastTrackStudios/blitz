@@ -744,6 +744,23 @@ impl<'doc> DocumentMutator<'doc> {
                 doc.active_node_id = None;
             }
 
+            // FTS: a live text-selection endpoint can name a node from the
+            // subtree being removed (a drag-selection left in place across a
+            // big re-render — switching profiles frees a whole patch list at
+            // once). Left dangling, the next `get_text_selection_ranges()`
+            // call resolves it and indexes a freed slab entry, panicking
+            // with "invalid key" in `traversal::resolve_for_traversal` — the
+            // same class of bug as the hover/active clears above, just a
+            // different stale reference. For an anonymous-block endpoint,
+            // `node_or_parent` names the PARENT, so this also catches the
+            // case where the parent itself is what's being removed.
+            if doc.text_selection.anchor.node_or_parent == Some(node_id) {
+                doc.text_selection.anchor.clear();
+            }
+            if doc.text_selection.focus.node_or_parent == Some(node_id) {
+                doc.text_selection.focus.clear();
+            }
+
             // Remove any snapshot for this node to prevent stale snapshot references
             // during style invalidation.
             if node.has_snapshot {
