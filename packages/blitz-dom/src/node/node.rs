@@ -990,6 +990,22 @@ impl Node {
             return true;
         }
 
+        // FTS: an element that clips its overflow is where its z-indexed
+        // descendants hoist to. CSS leaves them in the enclosing stacking
+        // context and still clips them to this box; blitz paints hoisted
+        // children from the stacking-context root, outside every clip
+        // layer in between — so a z-indexed child of an `overflow: scroll`
+        // pane was drawn over whatever lay outside the pane once scrolled
+        // (a knob over the top bar, an EQ ruler over the footswitches).
+        // Rooting them here paints them inside this box's clip and scroll
+        // offset, which is what a scrolling pane needs.
+        let box_style = style.get_box();
+        if !matches!(box_style.overflow_x, style::values::computed::Overflow::Visible)
+            || !matches!(box_style.overflow_y, style::values::computed::Overflow::Visible)
+        {
+            return true;
+        }
+
         // TODO: mix-blend-mode
         // TODO: filter
         // TODO: clip-path
