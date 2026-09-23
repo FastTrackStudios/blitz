@@ -1249,4 +1249,25 @@ mod test {
         let _ = document.clear_hover();
         assert_eq!(document.hover_node_id, None);
     }
+
+    /// A click whose handler removed its own target (the close button of
+    /// the card it is on): the default action runs after, on nothing, and
+    /// must not look the stale id up.
+    #[test]
+    fn a_default_action_on_a_removed_target_does_nothing() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let close = {
+            let mut mutator = document.mutate();
+            let close = mutator.create_element(qual_name!("button", html), vec![]);
+            mutator.append_children(root, &[close]);
+            close
+        };
+        document.mutate().remove_and_drop_node(close);
+        let mut event = blitz_traits::events::DomEvent::new(
+            close,
+            blitz_traits::events::DomEventData::Focus(blitz_traits::events::BlitzFocusEvent),
+        );
+        crate::events::handle_dom_event(&mut document, &mut event, |_| {});
+    }
 }
