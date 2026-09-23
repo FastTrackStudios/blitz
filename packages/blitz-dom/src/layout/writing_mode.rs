@@ -527,7 +527,11 @@ impl BaseDocument {
         let mut has_vertical = false;
         let mut current = Some(node_id);
         while let Some(id) = current {
-            let node = &self.nodes[id];
+            // FTS: a containing block removed since the last layout (a menu
+            // closed a moment ago) ends the walk.
+            let Some(node) = self.nodes.get(id) else {
+                break;
+            };
             pos.x += node.unrounded_layout().location.x - node.scroll_offset().x as f32;
             pos.y += node.unrounded_layout().location.y - node.scroll_offset().y as f32;
             has_vertical |= node.layout_data().writing_mode.is_vertical();

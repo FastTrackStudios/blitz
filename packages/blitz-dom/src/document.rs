@@ -1995,6 +1995,14 @@ impl BaseDocument {
         }
         self.hovered_scrollbar = hovered_scrollbar;
 
+        // FTS: a hit test between a removal and the next layout can find a
+        // node that has just been removed (a menu closed under the pointer):
+        // that is hovering nothing, and a hover left on one is stale.
+        let hit = hit.filter(|hit| self.nodes.contains_key(hit.node_id));
+        if self.hover_node_id.is_some_and(|id| !self.nodes.contains_key(id)) {
+            self.hover_node_id = None;
+            self.hover_node_is_text = false;
+        }
         // Store both the precise layout node that was hit (transient: used for
         // cursor/style queries) and its canonical DOM target (persistent: must
         // not reference layout-generated nodes, whose ids die on box-tree
@@ -2323,7 +2331,8 @@ impl BaseDocument {
         else {
             return Some(CursorIcon::Default);
         };
-        let node = &self.nodes[node_id];
+        // FTS: a hover node removed since the last hit test is no cursor.
+        let node = self.nodes.get(node_id)?;
 
         if let Some(subdoc) = node.subdoc().map(|doc| doc.inner())
             && subdoc.get_hover_node_id().is_some()
@@ -2407,7 +2416,11 @@ impl BaseDocument {
         let mut pos = crate::util::Point { x: 0.0, y: 0.0 };
         let mut current = Some(node_id);
         while let Some(id) = current {
-            let node = &self.nodes[id];
+            // FTS: a containing block removed since the last layout (a menu
+            // closed a moment ago) ends the walk.
+            let Some(node) = self.nodes.get(id) else {
+                break;
+            };
             pos.x += node.unrounded_layout().location.x - node.scroll_offset().x as f32;
             pos.y += node.unrounded_layout().location.y - node.scroll_offset().y as f32;
             current = node.containing_block();
