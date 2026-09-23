@@ -1177,4 +1177,25 @@ mod test {
             "form node is enabled"
         );
     }
+
+    /// A press can land on a node the same press removes — a menu row
+    /// that closes its menu. Focus then moves on without touching the
+    /// removed node, and focusing a removed node is refused.
+    #[test]
+    fn focus_moves_on_from_a_removed_node() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let (row, other) = {
+            let mut mutator = document.mutate();
+            let row = mutator.create_element(qual_name!("button", html), vec![]);
+            let other = mutator.create_element(qual_name!("button", html), vec![]);
+            mutator.append_children(root, &[row, other]);
+            (row, other)
+        };
+        assert!(document.set_focus_to(row));
+        document.mutate().remove_and_drop_node(row);
+        assert!(document.set_focus_to(other), "focus moves on without the removed node");
+        assert!(!document.set_focus_to(row), "a removed node takes no focus");
+        assert_eq!(document.focus_node_id, Some(other));
+    }
 }
