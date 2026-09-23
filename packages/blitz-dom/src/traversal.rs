@@ -129,7 +129,8 @@ impl BaseDocument {
         let mut chain = Vec::with_capacity(16);
         chain.push(node_id);
         chain.extend(
-            AncestorTraverser::new(self, node_id).filter(|id| self.nodes[*id].is_element()),
+            AncestorTraverser::new(self, node_id)
+                .filter(|id| self.nodes.get(*id).is_some_and(Node::is_element)),
         );
         chain
     }
@@ -262,9 +263,13 @@ impl BaseDocument {
     pub fn node_layout_ancestors(&self, node_id: usize) -> Vec<usize> {
         let mut ancestors = Vec::with_capacity(12);
         let mut maybe_id = Some(node_id);
+        // Between a removal and the next layout, a node's layout parent
+        // (or the node a hit test found) can already be gone — a menu
+        // that closed under the pointer. The path ends there.
         while let Some(id) = maybe_id {
+            let Some(node) = self.nodes.get(id) else { break };
             ancestors.push(id);
-            maybe_id = self.nodes[id].layout_parent.get();
+            maybe_id = node.layout_parent.get();
         }
         ancestors.reverse();
         ancestors

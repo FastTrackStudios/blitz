@@ -1252,10 +1252,12 @@ impl Node {
         let x = x + self.final_layout.location.x - self.scroll_offset.x as f32;
         let y = y + self.final_layout.location.y - self.scroll_offset.y as f32;
 
-        // Recurse up the layout hierarchy
+        // Recurse up the layout hierarchy — stopping at a layout parent
+        // removed since the last layout (a menu closed a moment ago).
         self.layout_parent
             .get()
-            .map(|i| self.with(i).absolute_position(x, y))
+            .and_then(|i| self.tree().get(i))
+            .map(|parent| parent.absolute_position(x, y))
             .unwrap_or(crate::util::Point { x, y })
     }
 

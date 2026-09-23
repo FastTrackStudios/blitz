@@ -1454,6 +1454,14 @@ impl BaseDocument {
             }
         }
         self.hovered_scrollbar = hovered_scrollbar;
+        // A hit test between a removal and the next layout can find a node
+        // that has just been removed (a menu closed under the pointer):
+        // that is hovering nothing, and a hover left on one is stale.
+        let hit = hit.filter(|hit| self.nodes.contains(hit.node_id));
+        if self.hover_node_id.is_some_and(|id| !self.nodes.contains(id)) {
+            self.hover_node_id = None;
+            self.hover_node_is_text = false;
+        }
         let hover_node_id = hit.map(|hit| hit.node_id);
         let new_is_text = hit.map(|hit| hit.is_text).unwrap_or(false);
 
@@ -1658,7 +1666,7 @@ impl BaseDocument {
     }
 
     pub fn get_cursor(&self) -> Option<CursorIcon> {
-        let node = &self.nodes[self.get_hover_node_id()?];
+        let node = self.nodes.get(self.get_hover_node_id()?)?;
 
         if let Some(subdoc) = node.subdoc().map(|doc| doc.inner()) {
             return subdoc.get_cursor();

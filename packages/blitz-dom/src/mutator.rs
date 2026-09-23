@@ -1198,4 +1198,26 @@ mod test {
         assert!(!document.set_focus_to(row), "a removed node takes no focus");
         assert_eq!(document.focus_node_id, Some(other));
     }
+
+    /// Between a removal and the next layout, a node's layout parent can
+    /// already be gone — a menu that closed under the pointer. Walking up
+    /// from it (hover, measuring) ends there instead of panicking.
+    #[test]
+    fn a_layout_parent_removed_before_the_next_layout_ends_the_walk() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let (menu, row) = {
+            let mut mutator = document.mutate();
+            let menu = mutator.create_element(qual_name!("div", html), vec![]);
+            let row = mutator.create_element(qual_name!("div", html), vec![]);
+            mutator.append_children(root, &[menu, row]);
+            (menu, row)
+        };
+        // As the last layout left it: the row laid out inside the menu.
+        document.nodes[row].layout_parent.set(Some(menu));
+        document.mutate().remove_and_drop_node(menu);
+        assert_eq!(document.node_layout_ancestors(row), vec![row]);
+        let _ = document.get_client_bounding_rect(row);
+        let _ = document.set_hover_to(0.0, 0.0);
+    }
 }
