@@ -93,8 +93,14 @@ impl Iterator for AncestorTraverser<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current_node = self.doc.get_node(self.current)?;
-        self.current = current_node.parent?;
-        Some(self.current)
+        let parent = current_node.parent?;
+        // A parent freed in a batch of mutations that left this node's link
+        // behind ends the walk: yielding its id sent every caller that
+        // indexes the slab (the pointer-move hover chain first) into a
+        // panic on "invalid key".
+        self.doc.get_node(parent)?;
+        self.current = parent;
+        Some(parent)
     }
 }
 
@@ -129,7 +135,8 @@ impl BaseDocument {
         let mut chain = Vec::with_capacity(16);
         chain.push(node_id);
         chain.extend(
-            AncestorTraverser::new(self, node_id).filter(|id| self.nodes[*id].is_element()),
+            AncestorTraverser::new(self, node_id)
+                .filter(|id| self.nodes.get(*id).is_some_and(Node::is_element)),
         );
         chain
     }
