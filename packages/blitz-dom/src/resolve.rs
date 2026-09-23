@@ -39,7 +39,16 @@ use crate::{
 
 impl BaseDocument {
     /// Restyle the tree and then relayout it
+    /// [`resolve`](Self::resolve) again at the animation time of the last
+    /// resolve: for bringing layout up to date between frames (an input
+    /// event arriving after mutations, before the frame that would resolve
+    /// them) without moving animations off the window's clock.
+    pub fn resolve_at_last_time(&mut self) {
+        self.resolve(self.last_animation_time);
+    }
+
     pub fn resolve(&mut self, current_time_for_animations: f64) {
+        self.last_animation_time = current_time_for_animations;
         if TDocument::as_node(&&self.nodes[0])
             .first_element_child()
             .is_none()
