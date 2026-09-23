@@ -618,6 +618,8 @@ impl Node {
             // A parent removed in the same batch of mutations (a subtree
             // replaced while one of its nodes is being updated) is simply the
             // end of the walk — there is nothing above it left to restyle.
+            // (Likewise a node detached with its parent already dropped: a
+            // closed menu's button, still hovered.)
             let Some(parent) = self.tree().get(parent_id) else {
                 break;
             };
@@ -1035,7 +1037,8 @@ impl Node {
 
     // Get the index of the current node in the parents child list
     pub fn child_index(&self) -> Option<usize> {
-        self.tree()[self.parent?]
+        self.tree()
+            .get(self.parent?)?
             .children
             .iter()
             .position(|id| *id == self.id)
@@ -1044,7 +1047,8 @@ impl Node {
     // Get the nth node in the parents child list
     pub fn forward(&self, n: usize) -> Option<&Node> {
         let child_idx = self.child_index().unwrap_or(0);
-        self.tree()[self.parent?]
+        self.tree()
+            .get(self.parent?)?
             .children
             .get(child_idx + n)
             .map(|id| self.with(*id))
@@ -1056,7 +1060,8 @@ impl Node {
             return None;
         }
 
-        self.tree()[self.parent?]
+        self.tree()
+            .get(self.parent?)?
             .children
             .get(child_idx - n)
             .map(|id| self.with(*id))

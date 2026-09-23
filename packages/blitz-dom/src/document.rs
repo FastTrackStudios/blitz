@@ -1644,8 +1644,14 @@ impl BaseDocument {
         state: ElementState,
         cb: impl FnOnce(&mut Node),
     ) {
-        // FTS: nothing to snapshot or change on a node that is gone.
-        if !self.nodes.contains_key(node_id) {
+        // FTS: gone, or detached and waiting to be dropped (its parent maybe
+        // already gone): nothing to restyle, and marking its ancestors
+        // would walk into freed ids.
+        if !self
+            .nodes
+            .get(node_id)
+            .is_some_and(|n| n.flags.is_in_document())
+        {
             return;
         }
         if self.style_depends_on_state(state) {
@@ -1998,8 +2004,13 @@ impl BaseDocument {
         // FTS: a hit test between a removal and the next layout can find a
         // node that has just been removed (a menu closed under the pointer):
         // that is hovering nothing, and a hover left on one is stale.
-        let hit = hit.filter(|hit| self.nodes.contains_key(hit.node_id));
-        if self.hover_node_id.is_some_and(|id| !self.nodes.contains_key(id)) {
+        let live = |doc: &Self, id: NodeId| {
+            doc.nodes
+                .get(id)
+                .is_some_and(|n| n.flags.is_in_document())
+        };
+        let hit = hit.filter(|hit| live(self, hit.node_id));
+        if self.hover_node_id.is_some_and(|id| !live(self, id)) {
             self.hover_node_id = None;
             self.hover_node_is_text = false;
         }
@@ -2019,8 +2030,15 @@ impl BaseDocument {
             return scrollbar_changed;
         }
 
-        let old_node_path = self.maybe_node_element_ancestors(self.hover_node_id);
-        let new_node_path = self.maybe_node_element_ancestors(hover_node_id);
+        // FTS: only what is still in the document: a node detached since the
+        // last layout (removed, not yet dropped) is not hovered or
+        // unhovered — restyling it walks up into a parent that is gone.
+        let in_document = |doc: &Self, path: Vec<NodeId>| -> Vec<NodeId> {
+            path.into_iter().filter(|&id| live(doc, id)).collect()
+        };
+        let old_node_path =
+            in_document(self, self.maybe_node_element_ancestors(self.hover_node_id));
+        let new_node_path = in_document(self, self.maybe_node_element_ancestors(hover_node_id));
         let same_count = old_node_path
             .iter()
             .zip(&new_node_path)
