@@ -287,7 +287,13 @@ impl BaseDocument {
         let mut ancestors = Vec::with_capacity(12);
         let mut maybe_id = Some(node_id);
         while let Some(id) = maybe_id {
-            let node = &self.nodes[id];
+            // FTS: a node removed by an event handler mid-gesture (a menu
+            // closing on pointerdown) can still be the hover / active /
+            // mousedown node when the next event arrives: treat a stale id as
+            // having no ancestors rather than panicking on the slab lookup.
+            let Some(node) = self.nodes.get(id) else {
+                break;
+            };
             if !node.is_element() {
                 break;
             }
