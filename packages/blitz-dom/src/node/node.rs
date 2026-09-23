@@ -341,7 +341,11 @@ impl Node {
     pub fn mark_ancestors_dirty(&self) {
         let mut current_id = self.parent;
         while let Some(parent_id) = current_id {
-            let parent = &self.tree()[parent_id];
+            // A node detached with its parent already dropped (a closed
+            // menu's button, still hovered) has no ancestors left to mark.
+            let Some(parent) = self.tree().get(parent_id) else {
+                break;
+            };
             // If this ancestor already has dirty_descendants set, we can stop
             // because all further ancestors must also have it set
             if parent.dirty_descendants.swap(true, Ordering::Relaxed) {
@@ -663,7 +667,8 @@ impl Node {
 
     // Get the index of the current node in the parents child list
     pub fn child_index(&self) -> Option<usize> {
-        self.tree()[self.parent?]
+        self.tree()
+            .get(self.parent?)?
             .children
             .iter()
             .position(|id| *id == self.id)
@@ -672,7 +677,8 @@ impl Node {
     // Get the nth node in the parents child list
     pub fn forward(&self, n: usize) -> Option<&Node> {
         let child_idx = self.child_index().unwrap_or(0);
-        self.tree()[self.parent?]
+        self.tree()
+            .get(self.parent?)?
             .children
             .get(child_idx + n)
             .map(|id| self.with(*id))
@@ -684,7 +690,8 @@ impl Node {
             return None;
         }
 
-        self.tree()[self.parent?]
+        self.tree()
+            .get(self.parent?)?
             .children
             .get(child_idx - n)
             .map(|id| self.with(*id))

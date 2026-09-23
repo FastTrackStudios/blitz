@@ -1220,4 +1220,33 @@ mod test {
         let _ = document.get_client_bounding_rect(row);
         let _ = document.set_hover_to(0.0, 0.0);
     }
+
+    /// A hovered button detached from a menu that is then dropped (the
+    /// menu's close button): its parent id is stale. Moving the pointer
+    /// unhovers it without walking into the dropped menu.
+    #[test]
+    fn a_detached_hovered_node_whose_parent_is_gone_is_left_alone() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let (menu, close) = {
+            let mut mutator = document.mutate();
+            let menu = mutator.create_element(qual_name!("div", html), vec![]);
+            let close = mutator.create_element(qual_name!("button", html), vec![]);
+            mutator.append_children(root, &[menu]);
+            mutator.append_children(menu, &[close]);
+            (menu, close)
+        };
+        document.hover_node_id = Some(close);
+        {
+            let mut mutator = document.mutate();
+            mutator.remove_node(close);
+            mutator.remove_and_drop_node(menu);
+        }
+        // As a detached node can still carry it: the parent it had.
+        document.nodes[close].parent = Some(menu);
+        document.nodes[close].mark_ancestors_dirty();
+        let _ = document.set_hover_to(0.0, 0.0);
+        let _ = document.clear_hover();
+        assert_eq!(document.hover_node_id, None);
+    }
 }
