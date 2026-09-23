@@ -1685,7 +1685,8 @@ impl Node {
                 return Some(node);
             }
             let id = node.layout_parent.get()?;
-            node = self.with(id);
+            // A freed layout parent ends the walk (see `absolute_position`).
+            node = self.tree().get(id)?;
         }
     }
 
@@ -1761,9 +1762,11 @@ impl Node {
         let x = x + self.final_layout().location.x - self.scroll_offset().x as f32;
         let y = y + self.final_layout().location.y - self.scroll_offset().y as f32;
 
-        // Recurse up the positioning hierarchy — FTS: stopping at a
-        // containing block removed since the last layout (a menu closed a
-        // moment ago).
+        // Recurse up the positioning hierarchy. FTS: a containing block the
+        // tree no longer holds (a menu closed a moment ago, or an anonymous
+        // box freed by a rebuild that left this node's link behind) ends the
+        // walk rather than panicking — this was reached from a pointer move
+        // right after a delay-timing change.
         self.containing_block()
             .and_then(|i| self.tree().get(i))
             .map(|parent| parent.absolute_position(x, y))
