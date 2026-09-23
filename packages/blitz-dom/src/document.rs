@@ -1735,7 +1735,8 @@ impl BaseDocument {
                 return Some(CursorIcon::Pointer);
             }
 
-            maybe_node = node.layout_parent.get().map(|node_id| node.with(node_id));
+            // A freed layout parent ends the walk (see `absolute_position`).
+            maybe_node = node.layout_parent.get().and_then(|node_id| node.tree().get(node_id));
         }
 
         // Return text cursor for text nodes
