@@ -351,7 +351,12 @@ impl Node {
     pub fn mark_ancestors_dirty(&self) {
         let mut current_id = self.parent;
         while let Some(parent_id) = current_id {
-            let parent = &self.tree()[parent_id];
+            // A parent removed in the same batch of mutations (a subtree
+            // replaced while one of its nodes is being updated) is simply the
+            // end of the walk — there is nothing above it left to restyle.
+            let Some(parent) = self.tree().get(parent_id) else {
+                break;
+            };
             // If this ancestor already has dirty_descendants set, we can stop
             // because all further ancestors must also have it set
             if parent.dirty_descendants.swap(true, Ordering::Relaxed) {
