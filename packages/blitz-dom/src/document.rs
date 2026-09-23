@@ -1516,7 +1516,11 @@ impl BaseDocument {
     }
 
     fn snapshot_node_impl(&mut self, node_id: NodeId, changed_attr: Option<&LocalName>) {
-        let node = &mut self.nodes[node_id];
+        // FTS: a node removed since its id was taken (a menu closed by the
+        // click that pressed it) has nothing to snapshot.
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
 
         // Do not snapshot nodes that have never been styled. A snapshot records an element's
         // pre-mutation state so a restyle can diff selector matches then-vs-now. An element
@@ -1635,6 +1639,10 @@ impl BaseDocument {
         state: ElementState,
         cb: impl FnOnce(&mut Node),
     ) {
+        // FTS: nothing to snapshot or change on a node that is gone.
+        if !self.nodes.contains_key(node_id) {
+            return;
+        }
         if self.style_depends_on_state(state) {
             self.snapshot_node_state_only(node_id);
         }
@@ -1773,6 +1781,15 @@ impl BaseDocument {
             return false;
         };
         if Some(focus_node_id) == self.focus_node_id {
+            return false;
+        }
+        // FTS: a press can land on a node the same press removes (a menu row
+        // that closes its menu): nothing to focus, and a focus left on it is
+        // stale.
+        if !self.nodes.contains_key(focus_node_id) {
+            if self.focus_node_id.is_some_and(|id| !self.nodes.contains_key(id)) {
+                self.focus_node_id = None;
+            }
             return false;
         }
         // A node that is not in the document cannot be focused
