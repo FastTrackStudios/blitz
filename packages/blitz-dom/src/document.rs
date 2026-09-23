@@ -399,6 +399,10 @@ pub struct BaseDocument {
     pub(crate) iframe_loads: HashMap<NodeId, crate::iframe::IframeLoad>,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) changed_nodes: HashSet<NodeId>,
+    /// The animation time the document was last resolved at — so a resolve
+    /// the window did not schedule ([`BaseDocument::resolve_at_last_time`])
+    /// stays on the window's animation clock.
+    pub(crate) last_animation_time: f64,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
 
@@ -553,6 +557,7 @@ impl BaseDocument {
             pending_resource_deallocations: Vec::new(),
 
             changed_nodes: HashSet::new(),
+            last_animation_time: 0.0,
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             pending_images: HashMap::new(),
