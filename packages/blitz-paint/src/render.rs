@@ -154,9 +154,22 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         if let Some(bg_color) = background_color {
             let bg_color = bg_color.as_srgb_color();
+            // The canvas is the whole surface, the safe area's insets
+            // included: the page's background runs under a phone's status
+            // bar and home indicator rather than leaving them the
+            // renderer's clear colour (white, in light mode). The insets
+            // arrive in physical pixels already (see blitz-shell), so they
+            // are not scaled again. The trailing insets are not known here
+            // (a phone on its side has a bottom inset and no top one), so
+            // the fill overshoots by a margin wider than any inset; the
+            // surface clips it.
+            const OVERSHOOT: f64 = 1024.0;
             let rect = Rect::from_origin_size(
-                (self.initial_x * self.scale, self.initial_y * self.scale),
-                (bg_width as f64, bg_height as f64),
+                (0.0, 0.0),
+                (
+                    bg_width as f64 + self.initial_x + OVERSHOOT,
+                    bg_height as f64 + self.initial_y + OVERSHOOT,
+                ),
             );
             scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
         }
