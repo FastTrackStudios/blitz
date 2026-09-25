@@ -312,7 +312,12 @@ impl<Rend: WindowRenderer> View<Rend> {
         inner.resolve(animation_time);
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
-        let insets = self.safe_area_insets.to_logical(scale);
+        // The painter offsets the scene in physical pixels (it draws at
+        // `scale`), so the safe area goes in physical too, as it does
+        // everywhere else here. Logical put the picture a third of the way
+        // down a 3x phone's notch while input (`pointer_coords`) took off the
+        // whole inset: every tap landed below what it pressed.
+        let insets = self.safe_area_insets;
 
         #[cfg(feature = "custom-widget")]
         inner.can_create_surfaces(&self.renderer as _);
@@ -391,7 +396,12 @@ impl<Rend: WindowRenderer> View<Rend> {
         let scale = inner.viewport().scale_f64();
         let is_animating = inner.is_animating();
         let is_blocked = inner.has_pending_critical_resources();
-        let insets = self.safe_area_insets.to_logical(scale);
+        // The painter offsets the scene in physical pixels (it draws at
+        // `scale`), so the safe area goes in physical too, as it does
+        // everywhere else here. Logical put the picture a third of the way
+        // down a 3x phone's notch while input (`pointer_coords`) took off the
+        // whole inset: every tap landed below what it pressed.
+        let insets = self.safe_area_insets;
 
         if !is_blocked && is_visible {
             // FTS: paint and present, timed apart from `resolve`, which
