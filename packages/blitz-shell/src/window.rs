@@ -307,6 +307,18 @@ impl<Rend: WindowRenderer> View<Rend> {
         // arrived while the renderer was Pending were no-ops on the renderer
         // (its `set_size` only matches Active), so the surface created during
         // resume could be at a stale size by the time we get here.
+        // As a resize would: the window's size and safe area as they are
+        // now — on an iPad that launches already the right way up no
+        // resize follows, and what was read at creation can be another
+        // shape's.
+        self.safe_area_insets = get_safe_area_insets(&*self.window);
+        let surface = self.window.surface_size();
+        if surface.width > 0 && surface.height > 0 {
+            let insets = self.safe_area_insets;
+            let width = surface.width.saturating_sub(insets.left + insets.right);
+            let height = surface.height.saturating_sub(insets.top + insets.bottom);
+            self.doc.inner_mut().viewport_mut().window_size = (width, height);
+        }
         let animation_time = self.current_animation_time();
         let mut inner = self.doc.inner_mut();
         inner.resolve(animation_time);
