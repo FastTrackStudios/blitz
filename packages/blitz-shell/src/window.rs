@@ -322,7 +322,16 @@ impl<Rend: WindowRenderer> View<Rend> {
         #[cfg(feature = "custom-widget")]
         inner.can_create_surfaces(&self.renderer as _);
 
-        self.renderer.set_size(width, height);
+        // The surface is the whole window: the viewport and its safe area,
+        // as every other resize here sizes it. Sized to the viewport alone,
+        // the first frame is drawn into a surface shorter than the window
+        // and stretched to fill it — the picture taller than laid out, its
+        // foot off screen — until a resize (which an iPad that launches
+        // already the right way up never sends) puts it right.
+        self.renderer.set_size(
+            width + insets.left + insets.right,
+            height + insets.top + insets.bottom,
+        );
 
         self.renderer.render(|scene| {
             paint_scene(
