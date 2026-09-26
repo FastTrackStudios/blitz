@@ -294,8 +294,10 @@ impl DocumentMutator<'_> {
         // click/tab/programmatic focus works on such elements. Computed from
         // `name` (not the `element`-borrowed `attr`/`tag`) so it can run
         // after the borrow ends.
-        let refresh_focussable =
-            matches!(name.local, local_name!("tabindex") | local_name!("disabled"));
+        let refresh_focussable = matches!(
+            name.local,
+            local_name!("tabindex") | local_name!("disabled")
+        );
         // `autofocus` applied as a normal attribute mutation (dioxus builds
         // the element then sets attrs — it never runs the HTML parser's
         // node_to_autofocus path). Focus the node once it's in the document.

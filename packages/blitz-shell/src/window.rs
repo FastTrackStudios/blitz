@@ -418,13 +418,9 @@ impl<Rend: WindowRenderer> View<Rend> {
             // anything to whoever is watching the terminal. The
             // application reads these beside `LAST_FRAME_MICROS` and can
             // draw them into the frame they describe.
-            let micros = |d: std::time::Duration| {
-                u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
-            };
-            blitz_traits::LAST_ENCODE_MICROS.store(
-                micros(encoded),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+            blitz_traits::LAST_ENCODE_MICROS
+                .store(micros(encoded), core::sync::atomic::Ordering::Relaxed);
             blitz_traits::LAST_PRESENT_MICROS.store(
                 micros(whole.saturating_sub(encoded)),
                 core::sync::atomic::Ordering::Relaxed,

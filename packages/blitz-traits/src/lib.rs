@@ -18,8 +18,7 @@ pub use smol_str::SmolStr;
 /// cadence and not the frame's cost. The two look identical from
 /// outside the shell and mean opposite things: one says the renderer is
 /// slow, the other says nothing was asked of it.
-pub static LAST_FRAME_MICROS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static LAST_FRAME_MICROS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// FTS: the same frame, split at the point the scene stops being built
 /// and starts being handed to the GPU — how long encoding the scene

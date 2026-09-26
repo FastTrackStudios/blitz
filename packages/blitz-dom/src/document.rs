@@ -1736,7 +1736,10 @@ impl BaseDocument {
             }
 
             // A freed layout parent ends the walk (see `absolute_position`).
-            maybe_node = node.layout_parent.get().and_then(|node_id| node.tree().get(node_id));
+            maybe_node = node
+                .layout_parent
+                .get()
+                .and_then(|node_id| node.tree().get(node_id));
         }
 
         // Return text cursor for text nodes

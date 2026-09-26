@@ -1005,9 +1005,13 @@ impl Node {
         // Rooting them here paints them inside this box's clip and scroll
         // offset, which is what a scrolling pane needs.
         let box_style = style.get_box();
-        if !matches!(box_style.overflow_x, style::values::computed::Overflow::Visible)
-            || !matches!(box_style.overflow_y, style::values::computed::Overflow::Visible)
-        {
+        if !matches!(
+            box_style.overflow_x,
+            style::values::computed::Overflow::Visible
+        ) || !matches!(
+            box_style.overflow_y,
+            style::values::computed::Overflow::Visible
+        ) {
             return true;
         }
 
