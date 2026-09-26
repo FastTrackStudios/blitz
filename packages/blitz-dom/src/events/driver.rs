@@ -1,6 +1,7 @@
 use crate::Document;
 use blitz_traits::events::{
-    BlitzPointerEvent, BlitzPointerId, DomEvent, DomEventData, EventState, UiEvent,
+    BlitzPointerEvent, BlitzPointerId, DomEvent, DomEventData, EventState, Point, PointerCoords,
+    UiEvent,
 };
 use std::collections::VecDeque;
 
@@ -171,6 +172,15 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                     should_clear_hover = true;
                 }
             }
+            UiEvent::PointerCancel(event) => {
+                hover_node_id = self.handle_pointer_move(event);
+                let mut doc = self.doc.inner_mut();
+                doc.unactive_node();
+
+                if event.is_primary && matches!(event.id, BlitzPointerId::Finger(_)) {
+                    should_clear_hover = true;
+                }
+            }
             _ => {}
         };
 
@@ -178,6 +188,7 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             UiEvent::PointerMove(_) => hover_node_id,
             UiEvent::PointerUp(_) => hover_node_id,
             UiEvent::PointerDown(_) => hover_node_id,
+            UiEvent::PointerCancel(_) => hover_node_id,
             UiEvent::Wheel(_) => hover_node_id,
             UiEvent::KeyUp(_) => focussed_node_id,
             UiEvent::KeyDown(_) => focussed_node_id,
@@ -192,7 +203,8 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                     target,
                     data,
                     DomEventData::PointerMove,
-                    DomEventData::MouseMove,
+                    Some(DomEventData::MouseMove),
+                    DomEventData::TouchMove,
                 );
             }
             UiEvent::PointerUp(data) => {
@@ -200,7 +212,8 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                     target,
                     data,
                     DomEventData::PointerUp,
-                    DomEventData::MouseUp,
+                    Some(DomEventData::MouseUp),
+                    DomEventData::TouchEnd,
                 );
             }
             UiEvent::PointerDown(data) => {
@@ -208,7 +221,19 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                     target,
                     data,
                     DomEventData::PointerDown,
-                    DomEventData::MouseDown,
+                    Some(DomEventData::MouseDown),
+                    DomEventData::TouchStart,
+                );
+            }
+            UiEvent::PointerCancel(data) => {
+                // `pointercancel` has no mouse-compatibility event, but does
+                // generate a `touchcancel` for touch-like inputs.
+                self.handle_pointer_event(
+                    target,
+                    data,
+                    DomEventData::PointerCancel,
+                    None::<fn(BlitzPointerEvent) -> DomEventData>,
+                    DomEventData::TouchCancel,
                 );
             }
             UiEvent::Wheel(data) => {
@@ -227,6 +252,7 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                 let mut dom_event =
                     DomEvent::new(target, DomEventData::AppleStandardKeybinding(data));
                 self.run_default_action(&mut dom_event);
+                self.process_queue();
             }
         };
 
@@ -246,15 +272,32 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
         target: usize,
         data: BlitzPointerEvent,
         make_ptr_data: impl FnOnce(BlitzPointerEvent) -> DomEventData,
-        make_mouse_data: impl FnOnce(BlitzPointerEvent) -> DomEventData,
+        make_mouse_data: Option<impl FnOnce(BlitzPointerEvent) -> DomEventData>,
+        make_touch_data: impl FnOnce(BlitzPointerEvent) -> DomEventData,
     ) {
         let mut ptr_event = DomEvent::new(target, make_ptr_data(data.clone()));
         let mut event_state = EventState::default();
         event_state = self.run_handler_event(&mut ptr_event, event_state);
-        if !event_state.is_cancelled() && data.is_mouse() {
-            let mut mouse_event = DomEvent::new(target, make_mouse_data(data));
-            event_state = self.run_handler_event(&mut mouse_event, event_state);
+
+        // Generate the corresponding compatibility event (mouse events for the
+        // mouse, touch events for fingers and pen/stylus input) and expose it to
+        // script. The default action is always run on the pointer event so that
+        // the shell layer and default actions remain pointer-based.
+        //
+        // `pointercancel` has no mouse equivalent, so `make_mouse_data` is `None`
+        // in that case and no mouse event is generated.
+        if !event_state.is_cancelled() {
+            if data.is_mouse() {
+                if let Some(make_mouse_data) = make_mouse_data {
+                    let mut mouse_event = DomEvent::new(target, make_mouse_data(data));
+                    event_state = self.run_handler_event(&mut mouse_event, event_state);
+                }
+            } else if data.is_finger() || data.is_pen() {
+                let mut touch_event = DomEvent::new(target, make_touch_data(data));
+                event_state = self.run_handler_event(&mut touch_event, event_state);
+            }
         }
+
         if !event_state.is_cancelled() {
             self.run_default_action(&mut ptr_event);
         }
@@ -270,6 +313,18 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
         }
     }
 
+    fn adjust_element_coords(
+        &self,
+        target: usize,
+        coords: &PointerCoords,
+        element: &mut Point<f32>,
+    ) {
+        if let Some(rect) = self.doc.inner().get_client_bounding_rect(target) {
+            element.x = coords.client_x - rect.x as f32;
+            element.y = coords.client_y - rect.y as f32;
+        }
+    }
+
     fn run_handler_event(
         &mut self,
         event: &mut DomEvent,
@@ -281,6 +336,37 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
         } else {
             vec![event.target]
         };
+
+        match &mut event.data {
+            DomEventData::PointerMove(data)
+            | DomEventData::PointerDown(data)
+            | DomEventData::PointerUp(data)
+            | DomEventData::PointerCancel(data)
+            | DomEventData::PointerEnter(data)
+            | DomEventData::PointerLeave(data)
+            | DomEventData::PointerOver(data)
+            | DomEventData::PointerOut(data)
+            | DomEventData::MouseMove(data)
+            | DomEventData::MouseDown(data)
+            | DomEventData::MouseUp(data)
+            | DomEventData::MouseEnter(data)
+            | DomEventData::MouseLeave(data)
+            | DomEventData::MouseOver(data)
+            | DomEventData::MouseOut(data)
+            | DomEventData::TouchStart(data)
+            | DomEventData::TouchEnd(data)
+            | DomEventData::TouchMove(data)
+            | DomEventData::TouchCancel(data)
+            | DomEventData::Click(data)
+            | DomEventData::ContextMenu(data)
+            | DomEventData::DoubleClick(data) => {
+                self.adjust_element_coords(event.target, &data.coords, &mut data.element)
+            }
+            DomEventData::Wheel(data) => {
+                self.adjust_element_coords(event.target, &data.coords, &mut data.element)
+            }
+            _ => {}
+        }
 
         let mut event_state = initial_event_state;
         self.handler

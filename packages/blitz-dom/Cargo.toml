@@ -11,25 +11,38 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+# `log-phase-times` is deliberately NOT here. It prints a line per frame —
+# `Resolve(1): 3.8ms (style: …, layout: …)` — from library code, forever, to
+# anyone who takes blitz with default features. That is a debugging tool, and
+# a debugging tool that is on by default is one that buries the application's
+# own logs in an app that redraws at 40 Hz. Ask for it when profiling:
+# `blitz-dom = { features = ["log-phase-times"] }`.
 default = [
     "svg",
     "woff",
     "accessibility",
-    "system_fonts",
-    "file_input",
+    "system-fonts",
+    "file-input",
+    "custom-widget"
 ]
+custom-widget = ["dep:anyrender", "accessibility"]
 tracing = ["dep:tracing"]
 svg = ["dep:usvg"]
 # WOFF decoding (using the "wuff" crate which is pure Rust)
 woff = ["dep:wuff"]
 accessibility = ["accesskit"]
-system_fonts = ["parley/system"]
+system-fonts = ["parley/system"]
+# complex-scripts: enable dictionary-based line-breaking
+complex-scripts = ["parley/complex-scripts"]
 autofocus = []
 floats = ["taffy/float_layout", "stylo_taffy/floats"]
-file_input = []
+file-input = []
+# Overlay-scrollbar thumb interaction (drag + hover tracking). Normally
+# enabled through `blitz-paint/scrollbars`, which paints the thumbs.
+scrollbars = []
 incremental = []
 parallel-construct = []
-log_phase_times = ["debug_timer/enable"]
+log-phase-times = ["debug_timer/enable"]
 
 [dependencies]
 # Blitz dependencies
@@ -52,6 +65,7 @@ smallvec = { workspace = true }
 
 # DioxusLabs dependencies
 taffy = { workspace = true }
+anyrender = { workspace = true, optional = true }
 
 # Linebender/Fontations dependencies
 accesskit = { workspace = true, optional = true }
@@ -80,7 +94,10 @@ url = { workspace = true }
 # Input
 keyboard-types = { workspace = true }
 cursor-icon = { workspace = true }
-thread_local.workspace = true
+thread_local = { workspace = true }
+
+# WASM
+web-time = { workspace = true }
 
 # HACK: Blitz doesn't need to depend on objc2 directly. But this feature flag is necessary
 # to prevent debug builds from panicking.

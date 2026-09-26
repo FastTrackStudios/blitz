@@ -1,17 +1,91 @@
 use anyrender::PaintScene;
 use blitz_dom::{BaseDocument, node::TextBrush, util::ToColorColor};
-use kurbo::{Affine, Stroke};
+use kurbo::{Affine, Rect, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
 use peniko::Fill;
 use style::values::computed::TextDecorationLine;
 
-use crate::SELECTION_COLOR;
+use crate::color::{Color, ToColorColor as _};
+use crate::{FONT_EMBOLDEN_ENABLED, SELECTION_COLOR};
+
+/// Draw the backgrounds of inline elements (e.g. `<span style="background: ...">`).
+///
+/// Each glyph run carries the node id of the innermost inline element it belongs to
+/// (via its brush). We look up that node's `background-color` and, if non-transparent,
+/// fill a rectangle covering the run's advance and its font's ascent/descent so that the
+/// background sits behind the text.
+///
+/// The inline root's own background is painted separately (as a normal block box), so
+/// runs belonging to the root are skipped to avoid drawing it twice.
+pub(crate) fn draw_inline_backgrounds<'a>(
+    scene: &mut impl PaintScene,
+    lines: impl Iterator<Item = Line<'a, TextBrush>>,
+    doc: &BaseDocument,
+    transform: Affine,
+    inline_root_id: usize,
+) {
+    for line in lines {
+        // For a TRANSLUCENT background (a selection highlight) we fill the
+        // FULL line box — including the line-height leading — so adjacent
+        // selected lines meet with no white gap, like a browser selection.
+        // For an OPAQUE background (e.g. the reverse-video block caret) we
+        // keep the tight glyph ascent→descent box so the cursor hugs the
+        // character. `line.metrics().baseline` is the baseline offset from
+        // the line top; `line_height` is the full box. FTS.
+        let lm = line.metrics();
+        let line_top_from_baseline = lm.baseline as f64;
+        let line_height = lm.line_height as f64;
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+
+            let node_id = glyph_run.style().brush.id;
+            if node_id == inline_root_id {
+                continue;
+            }
+
+            let Some(styles) = doc.get_node(node_id).and_then(|node| node.primary_styles()) else {
+                continue;
+            };
+
+            let current_color = styles.clone_color();
+            let bg_color = styles
+                .get_background()
+                .background_color
+                .resolve_to_absolute(&current_color)
+                .as_srgb_color();
+            if bg_color == Color::TRANSPARENT {
+                continue;
+            }
+
+            let x = glyph_run.offset() as f64;
+            let w = glyph_run.advance() as f64;
+            let baseline = glyph_run.baseline() as f64;
+            let translucent = bg_color.components[3] < 1.0;
+            let (y0, y1) = if translucent {
+                let top = baseline - line_top_from_baseline;
+                (top, top + line_height)
+            } else {
+                let metrics = glyph_run.run().metrics();
+                (
+                    baseline - metrics.ascent as f64,
+                    baseline + metrics.descent as f64,
+                )
+            };
+            let rect = Rect::new(x, y0, x + w, y1);
+
+            scene.fill(Fill::NonZero, transform, bg_color, None, &rect);
+        }
+    }
+}
 
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
     doc: &BaseDocument,
     transform: Affine,
+    scale: f64,
 ) {
     for line in lines {
         for item in line.items() {
@@ -46,11 +120,19 @@ pub(crate) fn stroke_text<'a>(
                 let has_strikethrough =
                     text_decoration_line.contains(TextDecorationLine::LINE_THROUGH);
 
+                let embolden = if FONT_EMBOLDEN_ENABLED {
+                    let fs = font_size as f64 / scale;
+                    kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
+                } else {
+                    kurbo::Vec2::default()
+                };
+
                 scene.draw_glyphs(
                     font,
                     font_size,
-                    true, // hint
+                    !FONT_EMBOLDEN_ENABLED, // hint
                     run.normalized_coords(),
+                    embolden,
                     Fill::NonZero,
                     &anyrender::Paint::from(text_color),
                     1.0, // alpha

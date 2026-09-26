@@ -86,6 +86,20 @@ input[type="button"] {
     padding: 1px 6px;
     color: black;
     background-color: #EFEFEF;
+    text-align: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Button-flavored inputs clip their contents to the border box and never
+ * produce a scrolling mechanism. This matches the UA stylesheet mandated by
+ * the HTML standard (https://html.spec.whatwg.org/#form-controls) and prevents
+ * an over-long value label from contributing overflow to the page. */
+input[type="submit"],
+input[type="reset"],
+input[type="button"] {
+    overflow: clip !important;
 }
 
 input[type="file"] {
@@ -95,6 +109,14 @@ input[type="file"] {
 }
 
 option {
+    display: none;
+}
+
+picture {
+    display: contents;
+}
+
+source {
     display: none;
 }
 
@@ -830,6 +852,12 @@ details>summary:first-of-type {
 
 details[open]>summary:first-of-type {
     list-style-type: disclosure-open;
+}
+
+/* When a <details> is closed, only its first <summary> is shown. Everything
+ * else (including any additional summaries) is hidden. */
+details:not([open])>:not(summary:first-of-type) {
+    display: none !important;
 }
 
 /* media elements */

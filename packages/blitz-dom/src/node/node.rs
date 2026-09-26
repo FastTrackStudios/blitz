@@ -1,11 +1,14 @@
+use crate::Document;
+use crate::layout::damage::HoistedPaintChildren;
 use bitflags::bitflags;
 use blitz_traits::events::{
     BlitzPointerEvent, BlitzPointerId, DomEventData, HitResult, PointerCoords,
 };
 use blitz_traits::shell::ShellProvider;
+use euclid::{Point2D, Rect, Size2D};
 use html_escape::encode_quoted_attribute_to_string;
 use keyboard_types::Modifiers;
-use kurbo::Affine;
+use kurbo::{Affine, Rect as KurboRect};
 use markup5ever::{LocalName, local_name};
 use parley::{BreakReason, Cluster, ClusterSide};
 use selectors::matching::ElementSelectorFlags;
@@ -23,6 +26,7 @@ use style::selector_parser::{PseudoElement, RestyleDamage};
 use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::SharedRwLock;
 use style::stylesheets::UrlExtraData;
+use style::values::computed::CSSPixelLength;
 use style::values::computed::Display as StyloDisplay;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style_dom::ElementState;
@@ -32,11 +36,14 @@ use taffy::{
     prelude::{Layout, Style},
 };
 
-use crate::Document;
-use crate::layout::damage::HoistedPaintChildren;
-
 use super::stylo_data::StyloData;
 use super::{Attribute, ElementData};
+
+#[derive(Clone, Copy)]
+enum OutputStyle {
+    Normal,
+    Pretty,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayOuter {
@@ -122,12 +129,22 @@ pub struct Node {
 
     // Taffy layout data:
     pub style: Style<Atom>,
+    /// Address of the Stylo computed values `style` was converted from.
+    ///
+    /// `style` is not self-contained: a `calc()` length is a raw pointer
+    /// *into* those computed values (`stylo_taffy::length_percentage`). A
+    /// restyle can swap in new computed values without producing damage (the
+    /// new values compare equal), freeing the old ones — so "no damage" alone
+    /// does not mean `style` is still safe to lay out with. The flush compares
+    /// this address and re-converts when it moved. `0` = never converted.
+    pub(crate) style_source: usize,
     pub display_constructed_as: StyloDisplay,
     pub cache: Cache,
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
     pub scroll_offset: crate::Point<f64>,
 
+    pub scrollable_overflow: KurboRect,
     pub transform: Option<Affine>,
 }
 
@@ -180,6 +197,7 @@ impl Node {
             after: None,
 
             style: Default::default(),
+            style_source: 0,
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             dirty_descendants: AtomicBool::new(true),
@@ -189,8 +207,23 @@ impl Node {
             final_layout: Layout::new(),
             scroll_offset: crate::Point::ZERO,
 
+            scrollable_overflow: KurboRect::ZERO,
             transform: None,
         }
+    }
+
+    pub fn set_transform(&mut self, scale: f32) -> Option<Affine> {
+        self.transform = self.primary_styles().and_then(|s| {
+            let w = self.final_layout.size.width * scale;
+            let h = self.final_layout.size.height * scale;
+            let reference_box = Rect::new(
+                Point2D::new(CSSPixelLength::new(0.0), CSSPixelLength::new(0.0)),
+                Size2D::new(CSSPixelLength::new(w), CSSPixelLength::new(h)),
+            );
+            crate::resolve_2d_transform(s.get_box(), reference_box)
+        });
+
+        self.transform
     }
 
     pub fn pe_by_index(&self, index: usize) -> Option<usize> {
@@ -286,11 +319,30 @@ impl Node {
     }
 
     /// Set appropriate damage for Stylo when an element's style attribute is updated
+    ///
+    /// The hint goes on this element, and the ANCESTORS are marked so the
+    /// style traversal reaches it — which is what every other mutation
+    /// path here does.
+    ///
+    /// It used to set `dirty_descendants` on itself, which says something
+    /// beneath me is dirty and makes the traversal walk this element's
+    /// whole subtree. For a style attribute that is almost always wrong:
+    /// a declaration changes the element's own computed style, and Stylo
+    /// already propagates to children when the change is one that
+    /// inherits. Setting it unconditionally means any inline style write
+    /// restyles everything under it.
+    ///
+    /// That is cheap on a button and ruinous on a container. A scrolling
+    /// view that moves its contents by writing one `transform` on a
+    /// wrapper — which is the standard way to scroll without re-rendering
+    /// — was restyling every node it wrapped, once per frame: measured at
+    /// 55ms of a 65ms frame with 1,700 nodes under the wrapper, against
+    /// 0.3ms on the frames that changed nothing.
     pub(crate) fn mark_style_attr_updated(&mut self) {
         if let Some(mut data) = self.stylo_element_data.get_mut() {
             data.hint |= RestyleHint::RESTYLE_STYLE_ATTRIBUTE;
         }
-        self.set_dirty_descendants();
+        self.mark_ancestors_dirty();
     }
 
     /// Marks all ancestors of this node as having dirty descendants.
@@ -299,7 +351,12 @@ impl Node {
     pub fn mark_ancestors_dirty(&self) {
         let mut current_id = self.parent;
         while let Some(parent_id) = current_id {
-            let parent = &self.tree()[parent_id];
+            // A parent removed in the same batch of mutations (a subtree
+            // replaced while one of its nodes is being updated) is simply the
+            // end of the walk — there is nothing above it left to restyle.
+            let Some(parent) = self.tree().get(parent_id) else {
+                break;
+            };
             // If this ancestor already has dirty_descendants set, we can stop
             // because all further ancestors must also have it set
             if parent.dirty_descendants.swap(true, Ordering::Relaxed) {
@@ -701,7 +758,7 @@ impl Node {
                 write!(
                     s,
                     "TEXT {}",
-                    &std::str::from_utf8(bytes.split_at(10.min(bytes.len())).0)
+                    std::str::from_utf8(bytes.split_at(10.min(bytes.len())).0)
                         .unwrap_or("INVALID UTF8")
                 )
             }
@@ -734,18 +791,59 @@ impl Node {
         s
     }
 
+    /// Renders the HTML of this node and all its children as a `String` without extra whitespace.
+    ///
+    /// Example output:
+    ///
+    /// ```text
+    /// <html><head /><body><main id="main"><div class="arbitrary-class" /></main></body></html>
+    /// ```
     pub fn outer_html(&self) -> String {
         let mut output = String::new();
         self.write_outer_html(&mut output);
         output
     }
 
+    /// Renders the HTML of this node and all its children as a `String` with whitespace for human
+    /// readability.
+    ///
+    /// Example output:
+    ///
+    /// ```text
+    /// <html>
+    ///   <head />
+    ///   <body>
+    ///     <main id="main">
+    ///       <div class="arbitrary-class" />
+    ///     </main>
+    ///   </body>
+    /// </html>
+    /// ```
+    pub fn outer_html_pretty(&self) -> String {
+        let mut output = String::new();
+        self.write_outer_html_pretty(&mut output);
+        output
+    }
+
     pub fn write_outer_html(&self, writer: &mut String) {
+        self.write_outer_html_in_style(writer, OutputStyle::Normal, 0);
+    }
+
+    pub fn write_outer_html_pretty(&self, writer: &mut String) {
+        self.write_outer_html_in_style(writer, OutputStyle::Pretty, 0);
+    }
+
+    fn write_outer_html_in_style(&self, writer: &mut String, style: OutputStyle, nesting: usize) {
+        const INDENT: &str = "  ";
         let has_children = !self.children.is_empty();
+        // FTS: legacy sRGB, not the colour's own space. A theme written in
+        // `oklch()` (Tailwind v4's default palette) serialises as
+        // `oklch(...)`, which usvg cannot parse — every `currentColor` icon
+        // under a class colour then drew black. `rgb()` it always reads.
         let current_color = self
             .primary_styles()
             .map(|style| style.clone_color())
-            .map(|color| color.to_css_string());
+            .map(|color| color.into_srgb_legacy().to_css_string());
 
         match &self.data {
             NodeData::Document => {}
@@ -753,9 +851,22 @@ impl Node {
             NodeData::AnonymousBlock(_) => {}
             // NodeData::Doctype { name, .. } => write!(s, "DOCTYPE {name}"),
             NodeData::Text(data) => {
+                if matches!(style, OutputStyle::Pretty) {
+                    for _ in 0..nesting {
+                        writer.push_str(INDENT);
+                    }
+                }
                 writer.push_str(data.content.as_str());
+                if matches!(style, OutputStyle::Pretty) {
+                    writer.push('\n');
+                }
             }
             NodeData::Element(data) => {
+                if matches!(style, OutputStyle::Pretty) {
+                    for _ in 0..nesting {
+                        writer.push_str(INDENT);
+                    }
+                }
                 writer.push('<');
                 writer.push_str(&data.name.local);
 
@@ -778,15 +889,26 @@ impl Node {
                     writer.push_str(" /");
                 }
                 writer.push('>');
+                if matches!(style, OutputStyle::Pretty) {
+                    writer.push('\n');
+                }
 
                 if has_children {
                     for &child_id in &self.children {
-                        self.tree()[child_id].write_outer_html(writer);
+                        self.tree()[child_id].write_outer_html_in_style(writer, style, nesting + 1);
                     }
 
+                    if matches!(style, OutputStyle::Pretty) {
+                        for _ in 0..nesting {
+                            writer.push_str(INDENT);
+                        }
+                    }
                     writer.push_str("</");
                     writer.push_str(&data.name.local);
                     writer.push('>');
+                    if matches!(style, OutputStyle::Pretty) {
+                        writer.push('\n');
+                    }
                 }
             }
         }
@@ -869,8 +991,31 @@ impl Node {
             return true;
         }
 
+        if self.transform.is_some() {
+            return true;
+        }
+
+        // FTS: an element that clips its overflow is where its z-indexed
+        // descendants hoist to. CSS leaves them in the enclosing stacking
+        // context and still clips them to this box; blitz paints hoisted
+        // children from the stacking-context root, outside every clip
+        // layer in between — so a z-indexed child of an `overflow: scroll`
+        // pane was drawn over whatever lay outside the pane once scrolled
+        // (a knob over the top bar, an EQ ruler over the footswitches).
+        // Rooting them here paints them inside this box's clip and scroll
+        // offset, which is what a scrolling pane needs.
+        let box_style = style.get_box();
+        if !matches!(
+            box_style.overflow_x,
+            style::values::computed::Overflow::Visible
+        ) || !matches!(
+            box_style.overflow_y,
+            style::values::computed::Overflow::Visible
+        ) {
+            return true;
+        }
+
         // TODO: mix-blend-mode
-        // TODO: transforms
         // TODO: filter
         // TODO: clip-path
         // TODO: mask
@@ -888,7 +1033,22 @@ impl Node {
     ///
     /// TODO: z-index
     /// (If multiple children are positioned at the position then a random one will be recursed into)
-    pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
+    pub fn hit(&self, x: f32, y: f32, scale: f64) -> Option<HitResult> {
+        self.hit_inner(x, y, scale, &mut None)
+    }
+
+    /// [`hit`](Self::hit), also resolving the innermost overlay scrollbar
+    /// thumb under the point into `scrollbar` during the same descent (so
+    /// thumb hit-testing shares the exact coordinate handling — transforms
+    /// included — of every other hit test).
+    pub(crate) fn hit_inner(
+        &self,
+        x: f32,
+        y: f32,
+        scale: f64,
+        scrollbar: &mut Option<crate::node::ScrollbarRef>,
+    ) -> Option<HitResult> {
+        use style::computed_values::pointer_events::T as PointerEvents;
         use style::computed_values::visibility::T as Visibility;
 
         // Don't hit on visbility:hidden elements
@@ -901,8 +1061,20 @@ impl Node {
             }
         }
 
+        // pointer-events:none makes this element transparent to hits, but its
+        // descendants are still tested (one may restore pointer-events:auto).
+        let pointer_events_none = self
+            .primary_styles()
+            .is_some_and(|style| style.clone_pointer_events() == PointerEvents::None);
+
         let mut x = x - self.final_layout.location.x + self.scroll_offset.x as f32;
         let mut y = y - self.final_layout.location.y + self.scroll_offset.y as f32;
+
+        if let Some(t) = self.transform {
+            let p = t.inverse() * kurbo::Point::new(x as f64 * scale, y as f64 * scale);
+            x = (p.x / scale) as f32;
+            y = (p.y / scale) as f32;
+        }
 
         let size = self.final_layout.size;
         let matches_self = !(x < 0.0
@@ -927,8 +1099,28 @@ impl Node {
             None => false,
         };
 
-        if !matches_self && !matches_content && !matches_hoisted_content {
+        // `scrollable_overflow` is stored in device (scaled) pixels, whereas the
+        // coordinates here are in CSS pixels, so unscale it before comparing.
+        let overflow = self.scrollable_overflow;
+
+        let matches_overflow = x >= (overflow.x0 / scale) as f32
+            && x <= (overflow.x1 / scale) as f32
+            && y >= (overflow.y0 / scale) as f32
+            && y <= (overflow.y1 / scale) as f32;
+
+        if !matches_self && !matches_content && !matches_hoisted_content && !matches_overflow {
             return None;
+        }
+
+        // Descendants overwrite, so the innermost scroll container's thumb
+        // wins. Thumb coords are border-box relative (unscrolled).
+        if matches_self
+            && let Some(sb) = self.scrollbar_at_local(
+                (x - self.scroll_offset.x as f32) as f64,
+                (y - self.scroll_offset.y as f32) as f64,
+            )
+        {
+            *scrollbar = Some(sb);
         }
 
         if self.flags.is_inline_root() {
@@ -946,7 +1138,21 @@ impl Node {
                 for hoisted_child in hoisted.pos_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self.with(hoisted_child.node_id).hit(x, y) {
+                    // A hoisted child that has left the tree is skipped, not
+                    // unwrapped.
+                    //
+                    // The stacking context is built during layout and holds
+                    // node ids. Remove a positioned child — a popup closing, a
+                    // modal dismissed — and hit-test before the next layout,
+                    // and the id is dangling: `with()` unwraps `None` and takes
+                    // the window down. The panic arrives on a pointer move,
+                    // far from whatever removed the node, and reads as a bug in
+                    // whichever component happened to be on screen. There is
+                    // nothing to hit at a node that does not exist.
+                    let Some(node) = self.tree().get(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = node.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
@@ -955,7 +1161,12 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            if let Some(hit) = self.with(*child_id).hit(x, y) {
+            // Skipped, not unwrapped — `paint_children` is filled during
+            // layout and goes stale the same way the hoisted lists do.
+            let Some(child) = self.tree().get(*child_id) else {
+                continue;
+            };
+            if let Some(hit) = child.hit_inner(x, y, scale, scrollbar) {
                 return Some(hit);
             }
         }
@@ -966,7 +1177,11 @@ impl Node {
                 for hoisted_child in hoisted.neg_z_hoisted_children().rev() {
                     let x = x - hoisted_child.position.x;
                     let y = y - hoisted_child.position.y;
-                    if let Some(hit) = self.with(hoisted_child.node_id).hit(x, y) {
+                    // Skipped, not unwrapped — see the positive-z loop above.
+                    let Some(node) = self.tree().get(hoisted_child.node_id) else {
+                        continue;
+                    };
+                    if let Some(hit) = node.hit_inner(x, y, scale, scrollbar) {
                         return Some(hit);
                     }
                 }
@@ -985,18 +1200,29 @@ impl Node {
                 {
                     let style_index = cluster.glyphs().next()?.style_index();
                     let node_id = layout.styles()[style_index].brush.id;
-                    return Some(HitResult {
-                        node_id,
-                        x,
-                        y,
-                        is_text: true,
-                    });
+                    // Same again: the inline layout's brush ids are captured
+                    // when it is built, and a node can leave the tree before
+                    // the next one. A run whose node is gone is not one the
+                    // pointer can be over.
+                    let text_pointer_events_none = self
+                        .tree()
+                        .get(node_id)
+                        .and_then(super::Node::primary_styles)
+                        .is_some_and(|style| style.clone_pointer_events() == PointerEvents::None);
+                    if !text_pointer_events_none {
+                        return Some(HitResult {
+                            node_id,
+                            x,
+                            y,
+                            is_text: true,
+                        });
+                    }
                 }
             }
         }
 
         // Self (this node)
-        if matches_self {
+        if matches_self && !pointer_events_none {
             return Some(HitResult {
                 node_id: self.id,
                 x,
@@ -1016,10 +1242,9 @@ impl Node {
             if node.flags.is_inline_root() {
                 return Some(node);
             }
-            match node.layout_parent.get() {
-                Some(id) => node = self.with(id),
-                None => return None,
-            }
+            let id = node.layout_parent.get()?;
+            // A freed layout parent ends the walk (see `absolute_position`).
+            node = self.tree().get(id)?;
         }
     }
 
@@ -1067,10 +1292,14 @@ impl Node {
         let x = x + self.final_layout.location.x - self.scroll_offset.x as f32;
         let y = y + self.final_layout.location.y - self.scroll_offset.y as f32;
 
-        // Recurse up the layout hierarchy
+        // Recurse up the layout hierarchy. A layout parent the tree no
+        // longer holds (an anonymous box freed by a rebuild that left this
+        // node's link behind) ends the walk rather than panicking — this was
+        // reached from a pointer move right after a delay-timing change.
         self.layout_parent
             .get()
-            .map(|i| self.with(i).absolute_position(x, y))
+            .and_then(|i| self.tree().get(i))
+            .map(|parent| parent.absolute_position(x, y))
             .unwrap_or(crate::util::Point { x, y })
     }
 
@@ -1101,6 +1330,8 @@ impl Node {
             button: Default::default(),
             buttons: Default::default(),
             details: Default::default(),
+            element: Default::default(),
+            active_pointers: Default::default(),
         }
     }
 }

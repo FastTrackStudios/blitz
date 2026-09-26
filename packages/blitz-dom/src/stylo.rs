@@ -4,6 +4,7 @@
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 
+use crate::StyleThreading;
 use crate::layout::damage::compute_layout_damage;
 use crate::node::Node;
 use crate::node::NodeData;
@@ -24,6 +25,14 @@ use style::color::AbsoluteColor;
 use style::data::{ElementDataMut, ElementDataRef};
 use style::dom::AttributeProvider;
 use style::global_style_data::STYLE_THREAD_POOL;
+
+/// Who is currently driving Stylo's global thread pool.
+///
+/// Held for the length of one document's parallel traversal. A second
+/// document that cannot take it traverses sequentially instead of
+/// sharing the pool, which is the crash in
+/// <https://github.com/DioxusLabs/blitz/issues/430>.
+static STYLE_POOL_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
 use style::properties::{Importance, PropertyDeclaration};
@@ -34,7 +43,7 @@ use style::selector_parser::RestyleDamage;
 use style::stylesheets::layer_rule::LayerOrder;
 use style::stylesheets::scope_rule::ImplicitScopeRoot;
 use style::values::AtomString;
-use style::values::computed::Percentage;
+use style::values::specified::NoCalcPercentage;
 use style::{
     Atom,
     context::{
@@ -80,6 +89,23 @@ impl crate::document::BaseDocument {
         let mut sets = self.animations.sets.write();
         for (key, set) in sets.iter_mut() {
             let node_id = key.node.id();
+
+            // Drop animations belonging to nodes that are no longer in the
+            // document. A removed element is never restyled, so it would never
+            // get a chance to cancel its own animations; an infinite animation
+            // would then keep `has_active_animations` set forever and force a
+            // redraw every frame. Emptying the set here lets the `retain` below
+            // discard it so the flag can clear on this same pass.
+            let in_document = self
+                .nodes
+                .get(node_id)
+                .is_some_and(|node| node.flags.is_in_document());
+            if !in_document {
+                set.animations.clear();
+                set.transitions.clear();
+                continue;
+            }
+
             self.nodes[node_id].set_restyle_hint(RestyleHint::RESTYLE_SELF);
 
             for animation in set.animations.iter_mut() {
@@ -125,8 +151,25 @@ impl crate::document::BaseDocument {
         if token.should_traverse() {
             // Style the elements, resolving their data
             let traverser = RecalcStyle::new(context);
-            let rayon_pool = STYLE_THREAD_POOL.pool();
-            style::driver::traverse_dom(&traverser, token, rayon_pool.as_ref());
+            // Stylo's thread pool is global, and two documents driving it
+            // at once is what issue #430 is: `already mutably borrowed`,
+            // from a shared borrow inside the pool rather than from
+            // anything either document did wrong.
+            //
+            // So a document CLAIMS the pool rather than assuming it. One
+            // gets the parallel traversal; anyone who arrives while it is
+            // held traverses sequentially for that frame, which is slower
+            // and correct. That is what lets `Parallel` be the default —
+            // the alternative was every document paying single-threaded
+            // style for a hazard almost none of them are in.
+            let claim = matches!(self.style_threading, StyleThreading::Parallel)
+                .then(|| STYLE_POOL_CLAIM.try_lock().ok())
+                .flatten();
+            let pool_guard = claim.is_some().then(|| STYLE_THREAD_POOL.pool());
+            let rayon_pool = pool_guard.as_ref().and_then(|g| g.as_ref());
+            style::driver::traverse_dom(&traverser, token, rayon_pool);
+            drop(pool_guard);
+            drop(claim);
         }
 
         for opaque in self.snapshots.keys() {
@@ -449,10 +492,15 @@ impl selectors::Element for BlitzNode<'_> {
         pe: &PseudoElement,
         _context: &mut MatchingContext<Self::Impl>,
     ) -> bool {
-        match self.data {
-            NodeData::AnonymousBlock(_) => *pe == PseudoElement::ServoAnonymousBox,
-            _ => false,
-        }
+        let pseudo = match self.stylo_element_data.get() {
+            Some(el) => el.styles.primary().pseudo().or(match &self.data {
+                NodeData::AnonymousBlock(_) => Some(PseudoElement::ServoAnonymousBox),
+                _ => None,
+            }),
+            None => None,
+        };
+
+        pseudo.is_some_and(|psuedo| psuedo == *pe)
     }
 
     fn apply_selector_flags(&self, flags: ElementSelectorFlags) {
@@ -834,23 +882,53 @@ impl<'a> TElement for BlitzNode<'a> {
             value: &str,
             filter_fn: impl FnOnce(&f32) -> bool,
         ) -> Option<style::values::specified::LengthPercentage> {
-            use style::values::specified::{AbsoluteLength, LengthPercentage, NoCalcLength};
+            use style::values::specified::{LengthPercentage, NoCalcLength};
             if let Some(value) = value.strip_suffix("px") {
                 let val: f32 = value.parse().ok()?;
-                return Some(LengthPercentage::Length(NoCalcLength::Absolute(
-                    AbsoluteLength::Px(val),
-                )));
+                return Some(LengthPercentage::Length(NoCalcLength::from_px(val)));
             }
 
             if let Some(value) = value.strip_suffix("%") {
                 let val: f32 = value.parse().ok()?;
-                return Some(LengthPercentage::Percentage(Percentage(val / 100.0)));
+                return Some(LengthPercentage::Percentage(NoCalcPercentage::new(
+                    val / 100.0,
+                )));
             }
 
             let val: f32 = value.parse().ok().filter(filter_fn)?;
-            Some(LengthPercentage::Length(NoCalcLength::Absolute(
-                AbsoluteLength::Px(val),
-            )))
+            Some(LengthPercentage::Length(NoCalcLength::from_px(val)))
+        }
+
+        /// Parse the value of an SVG `width`/`height` presentation attribute.
+        /// Unlike the legacy HTML dimension attributes, these accept any CSS
+        /// <length-percentage> (e.g. `1em`), and a unitless number means user
+        /// units, which map to CSS px.
+        fn parse_svg_size_attr(value: &str) -> Option<style::values::specified::LengthPercentage> {
+            use style::values::specified::{LengthPercentage, NoCalcLength};
+            use style_traits::ParsingMode;
+
+            let value = value.trim();
+            if let Some(number) = value.strip_suffix('%') {
+                let val: f32 = number.trim().parse().ok()?;
+                return (val >= 0.0)
+                    .then(|| LengthPercentage::Percentage(NoCalcPercentage::new(val / 100.0)));
+            }
+
+            // Split into number and unit: the unit is the trailing run of
+            // ASCII alphabetic characters (this never eats into a scientific
+            // exponent such as `1e3`, which ends in a digit).
+            let number_len = value
+                .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                .len();
+            let (number, unit) = value.split_at(number_len);
+            let val: f32 = number.trim().parse().ok().filter(|v| *v >= 0.0)?;
+            let length = if unit.is_empty() {
+                NoCalcLength::from_px(val)
+            } else {
+                NoCalcLength::parse_dimension_with_flags(ParsingMode::DEFAULT, false, val, unit)
+                    .ok()?
+            };
+            Some(LengthPercentage::Length(length))
         }
 
         for attr in elem.attrs() {
@@ -901,6 +979,25 @@ impl<'a> TElement for BlitzNode<'a> {
                     push_style(PropertyDeclaration::Height(Size::LengthPercentage(
                         NonNegative(height),
                     )));
+                }
+            }
+
+            // https://svgwg.org/svg2-draft/geometry.html#Sizing
+            // The `width` and `height` attributes on an `<svg>` element are
+            // presentation attributes that map to the CSS `width`/`height`
+            // properties, so e.g. `width="1em"` must resolve against the
+            // element's font-size like any other CSS length.
+            if *tag == local_name!("svg")
+                && (*name == local_name!("width") || *name == local_name!("height"))
+            {
+                if let Some(size) = parse_svg_size_attr(value) {
+                    use style::values::generics::{NonNegative, length::Size};
+                    let size = Size::LengthPercentage(NonNegative(size));
+                    push_style(if *name == local_name!("width") {
+                        PropertyDeclaration::Width(size)
+                    } else {
+                        PropertyDeclaration::Height(size)
+                    });
                 }
             }
 

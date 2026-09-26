@@ -34,7 +34,11 @@ impl BaseDocument {
     ///
     /// <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>
     pub fn reset_form_owner(&mut self, node_id: usize) {
-        let node = &self.nodes[node_id];
+        // FTS: tolerate a node dropped since it was queued — resetting the
+        // owner of a node that no longer exists is a no-op, not a panic.
+        let Some(node) = self.get_node(node_id) else {
+            return;
+        };
         let Some(element) = node.element_data() else {
             return;
         };
@@ -284,7 +288,7 @@ fn construct_entry_list(doc: &BaseDocument, form_id: usize, submitter_id: usize)
             continue;
         }
         // Otherwise, if the field element is an input element whose type attribute is in the File Upload state, then:
-        #[cfg(feature = "file_input")]
+        #[cfg(feature = "file-input")]
         if element.name.local == local_name!("input") && matches!(element_type, Some("file")) {
             // If there are no selected files, then create an entry with name and a new File object with an empty name, application/octet-stream as type, and an empty body, and append it to entry list.
             let Some(files) = element.file_data() else {

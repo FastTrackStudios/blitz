@@ -14,12 +14,13 @@ use crate::url::DocumentUrl;
 use crate::util::ImageType;
 use crate::{
     DEFAULT_CSS, DocumentConfig, DocumentMutator, DummyHtmlParserProvider, ElementData,
-    EventDriver, HtmlParserProvider, Node, NodeData, NoopEventHandler, TextNodeData,
+    EventDriver, HtmlParserProvider, Node, NodeData, NoopEventHandler, StyleThreading,
+    TextNodeData,
 };
 use blitz_traits::devtools::DevtoolSettings;
 use blitz_traits::events::{BlitzScrollEvent, DomEvent, DomEventData, HitResult, UiEvent};
 use blitz_traits::navigation::{DummyNavigationProvider, NavigationProvider};
-use blitz_traits::net::{DummyNetProvider, NetProvider, Request};
+use blitz_traits::net::{AbortSignal, DummyNetProvider, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, DummyShellProvider, ShellProvider, Viewport};
 use cursor_icon::CursorIcon;
 use linebender_resource_handle::Blob;
@@ -35,9 +36,8 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::Context as TaskContext;
-use std::time::Instant;
 use style::Atom;
 use style::animation::DocumentAnimationSet;
 use style::attr::{AttrIdentifier, AttrValue};
@@ -47,9 +47,11 @@ use style::properties::ComputedValues;
 use style::properties::style_structs::Font;
 use style::queries::values::PrefersColorScheme;
 use style::selector_parser::ServoElementSnapshot;
+use style::servo::media_features::PointerCapabilities;
 use style::servo_arc::Arc as ServoArc;
 use style::values::GenericAtomIdent;
-use style::values::computed::Overflow;
+use style::values::computed::ui::CursorKind;
+use style::values::computed::{Overflow, UserSelect};
 use style::{
     device::Device,
     dom::{TDocument, TNode},
@@ -60,6 +62,7 @@ use style::{
     stylist::Stylist,
 };
 use url::Url;
+use web_time::Instant;
 
 #[cfg(feature = "parallel-construct")]
 use thread_local::ThreadLocal;
@@ -190,6 +193,13 @@ pub struct BaseDocument {
     pub(crate) viewport_scroll: crate::Point<f64>,
     /// CSS media type used to evaluate `@media` rules.
     pub(crate) media_type: MediaType,
+    /// Strategy for Stylo's style traversal during `resolve`.
+    pub(crate) style_threading: StyleThreading,
+    /// Whether incremental layout is enabled for this document. Defaults to
+    /// whether the `incremental` feature is compiled in. Incremental layout can
+    /// only function when the feature is enabled, so toggling this on has no
+    /// effect in builds compiled without it.
+    pub(crate) incremental_layout: bool,
 
     // Events
     pub(crate) tx: Sender<DocumentEvent>,
@@ -238,6 +248,11 @@ pub struct BaseDocument {
     pub(crate) click_count: u16,
     /// Whether we're currently in a text selection drag (moved 2px+ from mousedown)
     pub(crate) drag_mode: DragMode,
+    /// The scrollbar thumb currently under the pointer, if any
+    pub(crate) hovered_scrollbar: Option<crate::node::ScrollbarRef>,
+    /// When each scroll container's overlay scrollbars were last shown
+    /// (scrolled, or the pointer left the thumb); drives their fade-out
+    pub(crate) scrollbar_activity: HashMap<usize, Instant>,
     /// Whether and what kind of scroll animation is currently in progress
     pub(crate) scroll_animation: ScrollAnimationState,
 
@@ -265,8 +280,19 @@ pub struct BaseDocument {
     pub(crate) sub_document_nodes: HashSet<usize>,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) changed_nodes: HashSet<usize>,
+    /// The animation time the document was last resolved at — so a resolve
+    /// the window did not schedule ([`BaseDocument::resolve_at_last_time`])
+    /// stays on the window's animation clock.
+    pub(crate) last_animation_time: f64,
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
+
+    /// Nodes that contain custom widgets
+    #[cfg(feature = "custom-widget")]
+    pub(crate) custom_widget_nodes: HashSet<usize>,
+    /// Rendering resources allocated by custom widgets that should be deallocated during the next render
+    #[cfg(feature = "custom-widget")]
+    pub(crate) pending_resource_deallocations: Vec<anyrender::ResourceId>,
 
     /// Cache of loaded images, keyed by URL. Allows reusing images across multiple
     /// elements without re-fetching from the network.
@@ -290,6 +316,10 @@ pub struct BaseDocument {
     pub shell_provider: Arc<dyn ShellProvider>,
     /// HTML parser provider. Used to parse HTML for setInnerHTML
     pub html_parser_provider: Arc<dyn HtmlParserProvider>,
+    /// Carried on every sub-resource `Request` this document issues; aborting
+    /// it cancels all in-flight fetches tied to this document. Set via
+    /// [`DocumentConfig::abort_signal`].
+    pub(crate) abort_signal: Option<AbortSignal>,
 }
 
 pub(crate) fn make_device(
@@ -300,12 +330,14 @@ pub(crate) fn make_device(
     let width = viewport.window_size.0 as f32 / viewport.scale();
     let height = viewport.window_size.1 as f32 / viewport.scale();
     let viewport_size = euclid::Size2D::new(width, height);
+    let device_size = euclid::Size2D::new(width, height) * viewport.scale();
     let device_pixel_ratio = euclid::Scale::new(viewport.scale());
 
     Device::new(
         media_type,
         selectors::matching::QuirksMode::NoQuirks,
         viewport_size,
+        device_size,
         device_pixel_ratio,
         Box::new(BlitzFontMetricsProvider { font_ctx }),
         ComputedValues::initial_values_with_font_override(Font::initial_values()),
@@ -313,6 +345,8 @@ pub(crate) fn make_device(
             ColorScheme::Light => PrefersColorScheme::Light,
             ColorScheme::Dark => PrefersColorScheme::Dark,
         },
+        PointerCapabilities::default(),
+        PointerCapabilities::default(),
     )
 }
 
@@ -336,7 +370,10 @@ impl BaseDocument {
                     source_cache: SourceCache::new_shared(),
                     collection: Collection::new(CollectionOptions {
                         shared: false,
-                        system_fonts: true,
+                        system_fonts: cfg!(all(
+                            feature = "system-fonts",
+                            not(target_arch = "wasm32")
+                        )),
                     }),
                 };
                 font_ctx
@@ -350,6 +387,7 @@ impl BaseDocument {
         style_config::set_pref!("layout.grid.enabled", true);
         style_config::set_pref!("layout.unimplemented", true);
         style_config::set_pref!("layout.columns.enabled", true);
+        style_config::set_pref!("layout.css.basic-shape-shape.enabled", true);
         style_config::set_pref!("layout.threads", -1);
 
         let viewport = config.viewport.unwrap_or_default();
@@ -394,6 +432,8 @@ impl BaseDocument {
             nodes_to_id,
             viewport,
             media_type,
+            style_threading: config.style_threading,
+            incremental_layout: cfg!(feature = "incremental"),
             devtool_settings: DevtoolSettings::default(),
             viewport_scroll: crate::Point::ZERO,
             url: base_url,
@@ -413,7 +453,14 @@ impl BaseDocument {
             subdoc_is_animating: false,
             has_canvas: false,
             sub_document_nodes: HashSet::new(),
+
+            #[cfg(feature = "custom-widget")]
+            custom_widget_nodes: HashSet::new(),
+            #[cfg(feature = "custom-widget")]
+            pending_resource_deallocations: Vec::new(),
+
             changed_nodes: HashSet::new(),
+            last_animation_time: 0.0,
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             pending_images: HashMap::new(),
@@ -423,10 +470,13 @@ impl BaseDocument {
             navigation_provider,
             shell_provider,
             html_parser_provider,
+            abort_signal: config.abort_signal,
             last_mousedown_time: None,
             mousedown_position: taffy::Point::ZERO,
             click_count: 0,
             drag_mode: DragMode::None,
+            hovered_scrollbar: None,
+            scrollbar_activity: HashMap::new(),
             scroll_animation: ScrollAnimationState::None,
             text_selection: TextSelection::default(),
         };
@@ -496,6 +546,29 @@ impl BaseDocument {
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// Wrapper around [`crate::net::stamped_request`]. Use the free function
+    /// when `&self` would conflict with a held `&mut` borrow on a field.
+    pub(crate) fn build_request(&self, url: url::Url) -> Request {
+        crate::net::stamped_request(url, self.abort_signal.as_ref())
+    }
+
+    pub fn favicon_url(&self) -> Option<String> {
+        self.tree().iter().find_map(|(_, node)| {
+            let data = &node.data;
+            if !data.is_element_with_tag_name(&local_name!("link")) {
+                return None;
+            }
+            let rel = data.attr(local_name!("rel"))?;
+            if !rel
+                .split_ascii_whitespace()
+                .any(|v| v.eq_ignore_ascii_case("icon"))
+            {
+                return None;
+            }
+            data.attr(local_name!("href")).map(|s| s.to_string())
+        })
     }
 
     pub fn get_node(&self, node_id: usize) -> Option<&Node> {
@@ -590,6 +663,32 @@ impl BaseDocument {
         }
     }
 
+    /// Toggle the `open` attribute of a `<details>` element, expanding or
+    /// collapsing it. This is the default action triggered when the element's
+    /// first `<summary>` child is activated.
+    pub fn toggle_details_open(&mut self, details_id: usize) {
+        use crate::qual_name;
+
+        let node = &self.nodes[details_id];
+        if !node.data.is_element_with_tag_name(&local_name!("details")) {
+            return;
+        }
+        let is_open = node.data.has_attr(local_name!("open"));
+
+        // Note: HTML attributes are in the empty (null) namespace, so the
+        // QualName must not use the html namespace here, else it won't match
+        // an `open` attribute created by the HTML parser.
+        let mut mutator = self.mutate();
+        if is_open {
+            mutator.clear_attribute(details_id, qual_name!("open"));
+        } else {
+            mutator.set_attribute(details_id, qual_name!("open"), "");
+        }
+        drop(mutator);
+
+        self.shell_provider.request_redraw();
+    }
+
     pub fn set_style_property(&mut self, node_id: usize, name: &str, value: &str) {
         let node = &mut self.nodes[node_id];
         let did_change = node.element_data_mut().unwrap().set_style_property(
@@ -615,6 +714,10 @@ impl BaseDocument {
         }
     }
 
+    pub fn sub_document_node_ids(&self) -> Vec<usize> {
+        self.sub_document_nodes.iter().copied().collect()
+    }
+
     pub fn set_sub_document(&mut self, node_id: usize, sub_document: Box<dyn Document>) {
         self.nodes[node_id]
             .element_data_mut()
@@ -629,6 +732,36 @@ impl BaseDocument {
             .unwrap()
             .remove_sub_document();
         self.sub_document_nodes.remove(&node_id);
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn custom_widget_node_ids(&self) -> Vec<usize> {
+        self.custom_widget_nodes.iter().copied().collect()
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn take_pending_resource_deallocations(&mut self) -> Vec<anyrender::ResourceId> {
+        std::mem::take(&mut self.pending_resource_deallocations)
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn set_custom_widget(&mut self, node_id: usize, widget: Box<dyn crate::Widget>) {
+        self.nodes[node_id]
+            .element_data_mut()
+            .unwrap()
+            .set_custom_widget(widget);
+        self.custom_widget_nodes.insert(node_id);
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn remove_custom_widget(&mut self, node_id: usize) {
+        let resources_to_deallocate = self.nodes[node_id]
+            .element_data_mut()
+            .unwrap()
+            .remove_custom_widget();
+        self.pending_resource_deallocations
+            .extend_from_slice(&resources_to_deallocate);
+        self.custom_widget_nodes.remove(&node_id);
     }
 
     pub fn root_node(&self) -> &Node {
@@ -667,6 +800,23 @@ impl BaseDocument {
     pub(crate) fn drop_node_ignoring_parent(&mut self, node_id: usize) -> Option<Node> {
         let mut node = self.nodes.try_remove(node_id);
         if let Some(node) = &mut node {
+            // The document remembers a handful of node ids across events —
+            // what the pointer is over, what it went down on, what is focussed
+            // and what is active. Nothing renews them when the node they name
+            // is removed, so a subtree that rebuilds mid-interaction leaves
+            // them pointing at a slab slot that is gone, and the next event
+            // that reads one panics with `invalid key`. The panic lands on a
+            // pointer move or a keystroke, far from the mutation that caused
+            // it, which is why it reads as a bug in whichever component
+            // happened to be on screen.
+            //
+            // Forgetting them here is the only place that scales: this is the
+            // single point where a node actually leaves the slab, and every
+            // guard added at a read site is one more site to remember next
+            // time. A cleared id means "nothing is hovered / focussed" for one
+            // event, which is the truth — the node is gone.
+            self.forget_node(node_id);
+
             if let Some(before) = node.before {
                 self.drop_node_ignoring_parent(before);
             }
@@ -679,6 +829,42 @@ impl BaseDocument {
             }
         }
         node
+    }
+
+    /// Drop every remembered reference to a node that no longer exists.
+    ///
+    /// Not just `drop_node_ignoring_parent`'s caller: a pseudo-element node
+    /// (`::before`/`::after`) is also freed on its own, whenever a restyle
+    /// removes its generated content (`remove_and_drop_pe`, in
+    /// `layout::construct`), bypassing this document's other removal paths
+    /// entirely. That left `hover_node_id` et al. pointing at a freed slab
+    /// slot exactly as the comment above describes, just reached from a
+    /// pseudo-element's removal instead of an ordinary node's — the panic
+    /// then lands on the next hover/active ancestor walk
+    /// (`node_layout_ancestors`), far from a `::before`/`::after` in sight.
+    /// `pub(crate)` so both removal paths share the one place this is done.
+    pub(crate) fn forget_node(&mut self, node_id: usize) {
+        for slot in [
+            &mut self.hover_node_id,
+            &mut self.focus_node_id,
+            &mut self.active_node_id,
+            &mut self.mousedown_node_id,
+        ] {
+            if *slot == Some(node_id) {
+                *slot = None;
+            }
+        }
+        self.changed_nodes.remove(&node_id);
+
+        // A live text-selection endpoint can also name this node — see the
+        // matching comment in `mutator::process_removed_subtree`, which
+        // covers ordinary removal; this covers a pseudo-element's.
+        if self.text_selection.anchor.node_or_parent == Some(node_id) {
+            self.text_selection.anchor.clear();
+        }
+        if self.text_selection.focus.node_or_parent == Some(node_id) {
+            self.text_selection.focus.clear();
+        }
     }
 
     /// Whether the document has been mutated
@@ -695,7 +881,19 @@ impl BaseDocument {
     pub fn deep_clone_node(&mut self, node_id: usize) -> usize {
         // Load existing node
         let node = &self.nodes[node_id];
-        let data = node.data.clone();
+        let mut data = node.data.clone();
+
+        match &mut data {
+            NodeData::Element(elem) | NodeData::AnonymousBlock(elem) => {
+                if let Some(arc) = elem.style_attribute.as_mut() {
+                    let read_guard = self.guard().read();
+                    let block = arc.read_with(&read_guard);
+                    *arc = ServoArc::new(self.guard().wrap(block.clone()));
+                }
+            }
+            _ => {}
+        }
+
         let children = node.children.clone();
 
         // Create new node
@@ -718,6 +916,11 @@ impl BaseDocument {
         fn remove_pe_ignoring_parent(doc: &mut BaseDocument, node_id: usize) -> Option<Node> {
             let mut node = doc.nodes.try_remove(node_id);
             if let Some(node) = &mut node {
+                // This path frees the slab slot directly, same as
+                // `drop_node_ignoring_parent` — forget it the same way, or a
+                // hovered/active/focused/selected `::before`/`::after` leaves
+                // a dangling id (see `forget_node`'s doc comment).
+                doc.forget_node(node_id);
                 for &child in &node.children {
                     remove_pe_ignoring_parent(doc, child);
                 }
@@ -767,7 +970,7 @@ impl BaseDocument {
                         let resolved_href = self.resolve_url(href);
                         self.net_provider.fetch(
                             self.id(),
-                            Request::get(resolved_href.clone()),
+                            self.build_request(resolved_href.clone()),
                             ResourceHandler::boxed(
                                 self.tx.clone(),
                                 self.id,
@@ -777,6 +980,7 @@ impl BaseDocument {
                                     source_url: resolved_href,
                                     guard: self.guard.clone(),
                                     net_provider: self.net_provider.clone(),
+                                    abort_signal: self.abort_signal.clone(),
                                 },
                             ),
                         );
@@ -817,6 +1021,7 @@ impl BaseDocument {
                 doc_id: self.id,
                 net_provider: self.net_provider.clone(),
                 shell_provider: self.shell_provider.clone(),
+                abort_signal: self.abort_signal.clone(),
             }),
             None,
             QuirksMode::NoQuirks,
@@ -848,6 +1053,7 @@ impl BaseDocument {
             &self.net_provider,
             &self.shell_provider,
             &self.guard.read(),
+            self.abort_signal.as_ref(),
         );
 
         // Store data on element
@@ -900,9 +1106,28 @@ impl BaseDocument {
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {
         self.pending_critical_resources.remove(&res.request_id);
 
-        let Ok(resource) = res.result else {
-            // TODO: handle error
-            return;
+        let resource = match res.result {
+            Ok(resource) => resource,
+            Err(err) => {
+                if let Some(url) = res.resolved_url.as_ref() {
+                    let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        url = url.as_str(),
+                        waiting_nodes = waiting_nodes.len(),
+                        error = err.as_str(),
+                        "Resource load failed"
+                    );
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = (waiting_nodes, err);
+                } else {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(error = err.as_str(), "Resource load failed (no url)");
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = err;
+                }
+                return;
+            }
         };
 
         match resource {
@@ -918,102 +1143,40 @@ impl BaseDocument {
                     return;
                 };
 
-                // Get all nodes waiting for this image
-                let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
-
-                #[cfg(feature = "tracing")]
-                tracing::info!(
-                    "Image {url} loaded, applying to {} nodes",
-                    waiting_nodes.len()
-                );
-
-                // Cache the image
-                self.image_cache.insert(url.clone(), image.clone());
-
-                // Apply to all waiting nodes
-                for (node_id, image_type) in waiting_nodes {
-                    let Some(node) = self.get_node_mut(node_id) else {
-                        continue;
-                    };
-
-                    match image_type {
-                        ImageType::Image => {
-                            node.element_data_mut().unwrap().special_data =
-                                SpecialElementData::Image(Box::new(image.clone()));
-
-                            // Clear layout cache
-                            node.cache.clear();
-                            node.insert_damage(ALL_DAMAGE);
-                        }
-                        ImageType::Background(idx) => {
-                            if let Some(Some(bg_image)) = node
-                                .element_data_mut()
-                                .and_then(|el| el.background_images.get_mut(idx))
-                            {
-                                bg_image.status = Status::Ok;
-                                bg_image.image = image.clone();
-                            }
-                        }
-                    }
-                }
+                self.apply_loaded_image(url, image);
             }
             #[cfg(feature = "svg")]
-            Resource::Svg(_kind, tree) => {
+            Resource::Svg(_kind, svg) => {
                 // Create the ImageData and cache it
-                let image = ImageData::Svg(tree);
+                let image = ImageData::Svg(svg);
 
                 let Some(url) = res.resolved_url.as_ref() else {
                     return;
                 };
 
-                // Get all nodes waiting for this image
-                let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
-
-                #[cfg(feature = "tracing")]
-                tracing::info!(
-                    "SVG {url} loaded, applying to {} nodes",
-                    waiting_nodes.len()
-                );
-
-                // Cache the image
-                self.image_cache.insert(url.clone(), image.clone());
-
-                // Apply to all waiting nodes
-                for (node_id, image_type) in waiting_nodes {
-                    let Some(node) = self.get_node_mut(node_id) else {
-                        continue;
-                    };
-
-                    match image_type {
-                        ImageType::Image => {
-                            node.element_data_mut().unwrap().special_data =
-                                SpecialElementData::Image(Box::new(image.clone()));
-
-                            // Clear layout cache
-                            node.cache.clear();
-                            node.insert_damage(ALL_DAMAGE);
-                        }
-                        ImageType::Background(idx) => {
-                            if let Some(Some(bg_image)) = node
-                                .element_data_mut()
-                                .and_then(|el| el.background_images.get_mut(idx))
-                            {
-                                bg_image.status = Status::Ok;
-                                bg_image.image = image.clone();
-                            }
-                        }
-                    }
-                }
+                self.apply_loaded_image(url, image);
             }
-            Resource::Font(bytes) => {
+            Resource::Font(bytes, overrides) => {
                 let font = Blob::new(Arc::new(bytes));
 
-                // TODO: Implement FontInfoOveride
+                // Build a `FontInfoOverride` from the `@font-face` descriptors
+                // captured during stylesheet parsing. Without this, parley
+                // reads the family name from the TTF's own metadata, which
+                // means CSS `font-family: 'Avenir Book'` won't match a font
+                // file that internally identifies as `Avenir 45 Book`.
+                let weight_override = overrides.weight.map(parley::fontique::FontWeight::new);
+                let info_override = parley::fontique::FontInfoOverride {
+                    family_name: overrides.family_name.as_deref(),
+                    weight: weight_override,
+                    style: overrides.style,
+                    ..Default::default()
+                };
+
                 // TODO: Investigate eliminating double-box
                 let mut global_font_ctx = self.font_ctx.lock().unwrap();
                 global_font_ctx
                     .collection
-                    .register_fonts(font.clone(), None);
+                    .register_fonts(font.clone(), Some(info_override));
 
                 #[cfg(feature = "parallel-construct")]
                 {
@@ -1022,7 +1185,9 @@ impl BaseDocument {
                             .thread_font_contexts
                             .get_or(|| RefCell::new(Box::new(global_font_ctx.clone())))
                             .borrow_mut();
-                        font_ctx.collection.register_fonts(font.clone(), None);
+                        font_ctx
+                            .collection
+                            .register_fonts(font.clone(), Some(info_override));
                     });
                 }
                 drop(global_font_ctx);
@@ -1036,8 +1201,66 @@ impl BaseDocument {
         }
     }
 
+    /// Cache a loaded image and apply it to all nodes waiting on it
+    /// (`<img>` elements, `background-image` layers and `mask-image` layers).
+    fn apply_loaded_image(&mut self, url: &str, image: ImageData) {
+        // Get all nodes waiting for this image
+        let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            "Image {url} loaded, applying to {} nodes",
+            waiting_nodes.len()
+        );
+
+        // Cache the image
+        self.image_cache.insert(url.to_string(), image.clone());
+
+        // Apply to all waiting nodes
+        for (node_id, image_type) in waiting_nodes {
+            let Some(node) = self.get_node_mut(node_id) else {
+                continue;
+            };
+
+            match image_type {
+                ImageType::Image => {
+                    node.element_data_mut().unwrap().special_data =
+                        SpecialElementData::Image(Box::new(image.clone()));
+
+                    // Clear layout cache
+                    node.cache.clear();
+                    node.insert_damage(ALL_DAMAGE);
+                }
+                ImageType::Background(idx) | ImageType::Mask(idx) => {
+                    let layer_image = node.element_data_mut().and_then(|el| {
+                        let images = match image_type {
+                            ImageType::Background(_) => &mut el.background_images,
+                            ImageType::Mask(_) => &mut el.mask_images,
+                            ImageType::Image => unreachable!(),
+                        };
+                        images.get_mut(idx)
+                    });
+                    if let Some(Some(layer_image)) = layer_image {
+                        layer_image.status = Status::Ok;
+                        layer_image.image = image.clone();
+                    }
+                }
+            }
+        }
+    }
+
     pub fn snapshot_node(&mut self, node_id: usize) {
         let node = &mut self.nodes[node_id];
+
+        // Do not snapshot nodes that have never been styled. A snapshot records an element's
+        // pre-mutation state so a restyle can diff selector matches then-vs-now. An element
+        // that has never been styled has no "then" to diff against. Snapshotting it anyway
+        // makes Stylo's invalidation unwrap its (absent) primary style and panic.
+        let has_been_styled = node.primary_styles().is_some();
+        if !has_been_styled {
+            return;
+        }
+
         let opaque_node_id = TNode::opaque(&&*node);
         node.has_snapshot = true;
         node.snapshot_handled
@@ -1067,7 +1290,7 @@ impl BaseDocument {
                                 .split_ascii_whitespace()
                                 .map(Atom::from)
                                 .collect();
-                            AttrValue::TokenList(attr.value.clone(), classes)
+                            AttrValue::TokenList(OnceLock::from(attr.value.clone()), classes)
                         } else {
                             AttrValue::String(attr.value.clone())
                         };
@@ -1103,16 +1326,7 @@ impl BaseDocument {
 
     // Takes (x, y) co-ordinates (relative to the )
     pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
-        if TDocument::as_node(&&self.nodes[0])
-            .first_element_child()
-            .is_none()
-        {
-            #[cfg(feature = "tracing")]
-            tracing::warn!("No DOM - not resolving hit test");
-            return None;
-        }
-
-        self.root_element().hit(x, y)
+        self.hit_with_scrollbar(x, y).0
     }
 
     pub fn focus_next_node(&mut self) -> Option<usize> {
@@ -1194,14 +1408,105 @@ impl BaseDocument {
         true
     }
 
+    /// The scrollbar thumb currently under the pointer, if any.
+    pub fn hovered_scrollbar(&self) -> Option<crate::node::ScrollbarRef> {
+        self.hovered_scrollbar
+    }
+
+    /// The scrollbar thumb currently being dragged, if any.
+    pub fn scrollbar_drag_target(&self) -> Option<crate::node::ScrollbarRef> {
+        match &self.drag_mode {
+            DragMode::ScrollbarDrag(state) => Some(state.scrollbar),
+            _ => None,
+        }
+    }
+
+    /// The current opacity of `node_id`'s overlay scrollbars. They show at
+    /// full opacity on scroll and fade out after a delay (Chromium's overlay
+    /// timings); the pointer resting on a thumb, or dragging it, holds them
+    /// visible.
+    pub fn scrollbar_opacity(&self, node_id: usize) -> f32 {
+        let interacting = |scrollbar: &crate::node::ScrollbarRef| scrollbar.node_id == node_id;
+        if self.hovered_scrollbar.as_ref().is_some_and(interacting)
+            || self
+                .scrollbar_drag_target()
+                .as_ref()
+                .is_some_and(interacting)
+        {
+            return 1.0;
+        }
+        self.scrollbar_activity.get(&node_id).map_or(0.0, |last| {
+            crate::node::scrollbar::opacity_at(last.elapsed())
+        })
+    }
+
+    /// Show `node_id`'s overlay scrollbars at full opacity and restart their
+    /// fade-out delay.
+    pub(crate) fn show_scrollbars(&mut self, node_id: usize) {
+        if cfg!(feature = "scrollbars") {
+            self.scrollbar_activity.insert(node_id, Instant::now());
+        }
+    }
+
+    /// Whether any overlay scrollbars are awaiting or animating their
+    /// fade-out (so frames must keep rendering until they finish).
+    fn scrollbars_animating(&self) -> bool {
+        use crate::node::scrollbar::{FADE_DELAY, FADE_DURATION};
+        self.scrollbar_activity
+            .values()
+            .any(|last| last.elapsed() < FADE_DELAY + FADE_DURATION)
+    }
+
+    /// [`hit`](Self::hit), also resolving the innermost overlay scrollbar
+    /// thumb under the point (shares the traversal, so it costs nothing
+    /// extra).
+    pub(crate) fn hit_with_scrollbar(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> (Option<HitResult>, Option<crate::node::ScrollbarRef>) {
+        if TDocument::as_node(&&self.nodes[0])
+            .first_element_child()
+            .is_none()
+        {
+            #[cfg(feature = "tracing")]
+            tracing::warn!("No DOM - not resolving hit test");
+            return (None, None);
+        }
+        let mut scrollbar = None;
+        let hit = self
+            .root_element()
+            .hit_inner(x, y, self.viewport().scale_f64(), &mut scrollbar);
+        (hit, scrollbar)
+    }
+
     pub fn set_hover_to(&mut self, x: f32, y: f32) -> bool {
-        let hit = self.hit(x, y);
+        let (hit, hovered_scrollbar) = self.hit_with_scrollbar(x, y);
+        // A faded-out thumb is not interactive: pointer moves never fade
+        // overlay scrollbars back in (only scrolling shows them).
+        let hovered_scrollbar =
+            hovered_scrollbar.filter(|scrollbar| self.scrollbar_opacity(scrollbar.node_id) > 0.0);
+        // Scrollbar-thumb hover is part of hover state: track it here so a
+        // pointer crossing a thumb restyles it even when the hit node (the
+        // content under the overlay thumb) is unchanged.
+        let scrollbar_changed = hovered_scrollbar != self.hovered_scrollbar;
+        if scrollbar_changed {
+            // Entering a thumb restores full opacity mid-fade; leaving one
+            // restarts the fade-out delay.
+            for scrollbar in [self.hovered_scrollbar, hovered_scrollbar]
+                .into_iter()
+                .flatten()
+            {
+                self.show_scrollbars(scrollbar.node_id);
+            }
+        }
+        self.hovered_scrollbar = hovered_scrollbar;
         let hover_node_id = hit.map(|hit| hit.node_id);
         let new_is_text = hit.map(|hit| hit.is_text).unwrap_or(false);
 
         // Return early if the new node is the same as the already-hovered node
         if hover_node_id == self.hover_node_id {
-            return false;
+            return scrollbar_changed;
         }
 
         let old_node_path = self.maybe_node_layout_ancestors(self.hover_node_id);
@@ -1222,8 +1527,7 @@ impl BaseDocument {
         self.hover_node_is_text = new_is_text;
 
         // Update the cursor
-        let cursor = self.get_cursor().unwrap_or_default();
-        self.shell_provider.set_cursor(cursor);
+        self.shell_provider.set_cursor(self.get_cursor());
 
         // Request redraw
         self.shell_provider.request_redraw();
@@ -1245,8 +1549,7 @@ impl BaseDocument {
         self.hover_node_is_text = false;
 
         // Update the cursor
-        let cursor = self.get_cursor().unwrap_or_default();
-        self.shell_provider.set_cursor(cursor);
+        self.shell_provider.set_cursor(self.get_cursor());
 
         // Request redraw
         self.shell_provider.request_redraw();
@@ -1315,6 +1618,19 @@ impl BaseDocument {
         self.viewport.clone()
     }
 
+    /// Returns whether incremental layout is currently enabled for this document.
+    pub fn incremental_layout(&self) -> bool {
+        self.incremental_layout
+    }
+
+    /// Enables or disables incremental layout for this document.
+    ///
+    /// Note that incremental layout only works when the `incremental` feature is
+    /// compiled in; enabling it at runtime has no effect otherwise.
+    pub fn set_incremental_layout(&mut self, enabled: bool) {
+        self.incremental_layout = enabled;
+    }
+
     pub fn devtools(&self) -> &DevtoolSettings {
         &self.devtool_settings
     }
@@ -1323,15 +1639,56 @@ impl BaseDocument {
         &mut self.devtool_settings
     }
 
+    pub fn subdoc(&self, node_id: usize) -> Option<&dyn Document> {
+        self.get_node(node_id)
+            .and_then(|node| node.element_data())
+            .and_then(|el| el.sub_doc_data())
+    }
+
+    pub fn subdoc_mut(&mut self, node_id: usize) -> Option<&mut dyn Document> {
+        self.get_node_mut(node_id)
+            .and_then(|node| node.element_data_mut())
+            .and_then(|el| el.sub_doc_data_mut())
+    }
+
     pub fn is_animating(&self) -> bool {
+        #[cfg(feature = "custom-widget")]
+        let has_custom_widgets = !self.custom_widget_nodes.is_empty();
+        #[cfg(not(feature = "custom-widget"))]
+        let has_custom_widgets = false;
+
         self.has_canvas
             | self.has_active_animations
             | self.subdoc_is_animating
+            | has_custom_widgets
             | (self.scroll_animation != ScrollAnimationState::None)
+            | self.scrollbars_animating()
     }
 
     /// Update the device and reset the stylist to process the new size
     pub fn set_stylist_device(&mut self, device: Device) {
+        // Seed the new device with the root element's current style and font-relative
+        // unit state (used to resolve rem/rlh/rex/rch/rcap/ric units). Stylo only
+        // updates this state when the root element's style *changes* during a restyle,
+        // so a freshly-built device would otherwise resolve these units against the
+        // default font-size (16px) until the root's font-size next changes.
+        let root_styles = self
+            .try_root_element()
+            .and_then(|root| root.primary_styles());
+        if let Some(root_style) = root_styles.as_deref() {
+            device.set_root_style(root_style);
+
+            let font = root_style.get_font();
+            let font_size = font.clone_font_size().computed_size();
+            device.set_root_font_size(root_style.effective_zoom.unzoom(font_size.px()));
+
+            let line_height = device
+                .calc_line_height(font, root_style.writing_mode, None)
+                .0;
+            device.set_root_line_height(root_style.effective_zoom.unzoom(line_height.px()));
+        }
+        drop(root_styles);
+
         let origins = {
             let guard = &self.guard;
             let guards = StylesheetGuards {
@@ -1355,11 +1712,12 @@ impl BaseDocument {
         }
 
         let style = node.primary_styles()?;
-        let keyword = stylo_to_cursor_icon(style.clone_cursor().keyword);
+        let user_select = style.clone_user_select();
+        let keyword = style.clone_cursor().keyword;
 
         // Return cursor from style if it is non-auto
-        if keyword != CursorIcon::Default {
-            return Some(keyword);
+        if keyword != CursorKind::Auto {
+            return stylo_to_cursor_icon(keyword);
         }
 
         // Return text cursor for text inputs
@@ -1377,12 +1735,19 @@ impl BaseDocument {
                 return Some(CursorIcon::Pointer);
             }
 
-            maybe_node = node.layout_parent.get().map(|node_id| node.with(node_id));
+            // A freed layout parent ends the walk (see `absolute_position`).
+            maybe_node = node
+                .layout_parent
+                .get()
+                .and_then(|node_id| node.tree().get(node_id));
         }
 
         // Return text cursor for text nodes
         if self.hover_node_is_text {
-            return Some(CursorIcon::Text);
+            return Some(match user_select {
+                UserSelect::Text | UserSelect::All | UserSelect::Auto => CursorIcon::Text,
+                UserSelect::None => CursorIcon::Default,
+            });
         }
 
         // Else fallback to default cursor
@@ -1409,22 +1774,79 @@ impl BaseDocument {
         y: f64,
         mut dispatch_event: F,
     ) -> bool {
+        // Per the CSS overflow propagation rules, the root element's overflow (and usually
+        // the <body>'s) is applied to the viewport, and the element itself must not have
+        // a scrolling mechanism of its own. So scrolls that reach the root element are
+        // forwarded to the viewport rather than scrolling the root element itself.
+        if self.try_root_element().is_some_and(|el| el.id == node_id) {
+            let has_changed = self.scroll_viewport_by_has_changed(x, y);
+            if has_changed {
+                let layout = self.root_element().final_layout;
+                let scale = self.viewport.scale() as f64;
+                let event = BlitzScrollEvent {
+                    scroll_top: self.viewport_scroll.y,
+                    scroll_left: self.viewport_scroll.x,
+                    scroll_width: layout.size.width.max(layout.content_size.width) as i32,
+                    scroll_height: layout.size.height.max(layout.content_size.height) as i32,
+                    client_width: (self.viewport.window_size.0 as f64 / scale) as i32,
+                    client_height: (self.viewport.window_size.1 as f64 / scale) as i32,
+                };
+                dispatch_event(DomEvent::new(node_id, DomEventData::Scroll(event)));
+            }
+            return has_changed;
+        }
+
         let Some(node) = self.nodes.get_mut(node_id) else {
             return false;
         };
 
-        let is_html_or_body = node.data.downcast_element().is_some_and(|e| {
-            let tag = &e.name.local;
-            tag == "html" || tag == "body"
-        });
+        // Text inputs scroll their own internal text content rather than using the generic
+        // overflow mechanism: single-line inputs scroll horizontally, multi-line inputs scroll
+        // vertically. Any delta the input cannot consume is bubbled up to an ancestor scroller.
+        if node
+            .element_data()
+            .is_some_and(|el| el.text_input_data().is_some())
+        {
+            let parent = node.parent;
+            let content_box_width = node.final_layout.content_box_width();
+            let content_box_height = node.final_layout.content_box_height();
+            let input = node
+                .element_data_mut()
+                .and_then(|el| el.text_input_data_mut())
+                .unwrap();
+
+            let (bubble_x, bubble_y) = if input.is_multiline {
+                (
+                    x,
+                    input.scroll_by(y as f32, content_box_width, content_box_height) as f64,
+                )
+            } else {
+                (
+                    input.scroll_by(x as f32, content_box_width, content_box_height) as f64,
+                    y,
+                )
+            };
+
+            let has_changed = bubble_x != x || bubble_y != y;
+
+            if bubble_x != 0.0 || bubble_y != 0.0 {
+                let bubbled = if let Some(parent) = parent {
+                    self.scroll_node_by_has_changed(parent, bubble_x, bubble_y, dispatch_event)
+                } else {
+                    self.scroll_viewport_by_has_changed(bubble_x, bubble_y)
+                };
+                return bubbled | has_changed;
+            }
+
+            return has_changed;
+        }
 
         let (can_x_scroll, can_y_scroll) = node
             .primary_styles()
             .map(|styles| {
                 (
                     matches!(styles.clone_overflow_x(), Overflow::Scroll | Overflow::Auto),
-                    matches!(styles.clone_overflow_y(), Overflow::Scroll | Overflow::Auto)
-                        || (styles.clone_overflow_y() == Overflow::Visible && is_html_or_body),
+                    matches!(styles.clone_overflow_y(), Overflow::Scroll | Overflow::Auto),
                 )
             })
             .unwrap_or((false, false));
@@ -1492,8 +1914,13 @@ impl BaseDocument {
             dispatch_event(DomEvent::new(node_id, DomEventData::Scroll(event)));
         }
 
+        let parent = node.parent;
+        if has_changed {
+            self.show_scrollbars(node_id);
+        }
+
         if bubble_x != 0.0 || bubble_y != 0.0 {
-            if let Some(parent) = node.parent {
+            if let Some(parent) = parent {
                 return self.scroll_node_by_has_changed(parent, bubble_x, bubble_y, dispatch_event)
                     | has_changed;
             } else {
@@ -1510,20 +1937,21 @@ impl BaseDocument {
 
     /// Scroll the viewport by the given values
     pub fn scroll_viewport_by_has_changed(&mut self, x: f64, y: f64) -> bool {
-        let content_size = self.root_element().final_layout.size;
+        // The viewport scrolls the root element's scrollable overflow, which includes both
+        // the root element itself and any content which overflows it (e.g. when the root
+        // element has a fixed height but its content is taller).
+        let root_layout = &self.root_element().final_layout;
+        let content_width = root_layout.size.width.max(root_layout.content_size.width) as f64;
+        let content_height = root_layout.size.height.max(root_layout.content_size.height) as f64;
         let new_scroll = (self.viewport_scroll.x - x, self.viewport_scroll.y - y);
         let window_width = self.viewport.window_size.0 as f64 / self.viewport.scale() as f64;
         let window_height = self.viewport.window_size.1 as f64 / self.viewport.scale() as f64;
 
         let initial = self.viewport_scroll;
-        self.viewport_scroll.x = f64::max(
-            0.0,
-            f64::min(new_scroll.0, content_size.width as f64 - window_width),
-        );
-        self.viewport_scroll.y = f64::max(
-            0.0,
-            f64::min(new_scroll.1, content_size.height as f64 - window_height),
-        );
+        self.viewport_scroll.x =
+            f64::max(0.0, f64::min(new_scroll.0, content_width - window_width));
+        self.viewport_scroll.y =
+            f64::max(0.0, f64::min(new_scroll.1, content_height - window_height));
 
         self.viewport_scroll != initial
     }
@@ -1548,6 +1976,68 @@ impl BaseDocument {
 
     pub fn set_viewport_scroll(&mut self, scroll: crate::Point<f64>) {
         self.viewport_scroll = scroll;
+    }
+
+    /// Find the node targeted by a URL fragment (the `#...` part of a URL).
+    ///
+    /// Per the HTML spec, this is the element whose `id` matches the fragment, falling
+    /// back to the first `<a>` element whose `name` attribute matches.
+    pub fn get_fragment_target(&self, fragment: &str) -> Option<usize> {
+        if let Some(node_id) = self.get_element_by_id(fragment) {
+            return Some(node_id);
+        }
+
+        // Fall back to a named anchor: `<a name="...">`
+        self.nodes.iter().find_map(|(id, node)| {
+            let el = node.element_data()?;
+            (el.name.local == local_name!("a") && el.attr(local_name!("name")) == Some(fragment))
+                .then_some(id)
+        })
+    }
+
+    /// Scroll the viewport so that the given node is aligned with the top of the viewport.
+    pub fn scroll_to_node(&mut self, node_id: usize) {
+        let Some(node) = self.nodes.get(node_id) else {
+            return;
+        };
+
+        // `absolute_position` gives the node's position in document space (it does not
+        // account for the viewport scroll), so it is the scroll offset we want to land on.
+        let target = node.absolute_position(0.0, 0.0);
+        let current = self.viewport_scroll;
+
+        // `scroll_viewport_by` subtracts the delta from the current scroll offset, so pass
+        // `current - target` in order to land on `target`.
+        self.scroll_viewport_by(current.x - target.x as f64, current.y - target.y as f64);
+    }
+
+    /// Scroll to the element targeted by the given URL fragment (the `#...` part of a URL).
+    ///
+    /// An empty fragment (or a `top` fragment that matches no element) scrolls to the top
+    /// of the document, matching browser behaviour. Returns `true` if a scroll target was
+    /// found.
+    pub fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        // Fragments are percent-encoded in URLs (e.g. `%20`); decode before matching.
+        let decoded = percent_encoding::percent_decode_str(fragment)
+            .decode_utf8_lossy()
+            .into_owned();
+
+        if !decoded.is_empty() {
+            if let Some(node_id) = self.get_fragment_target(&decoded) {
+                self.scroll_to_node(node_id);
+                return true;
+            }
+        }
+
+        // An empty fragment, or the special "top" fragment when no matching element exists,
+        // scrolls to the top of the document.
+        if decoded.is_empty() || decoded.eq_ignore_ascii_case("top") {
+            let current = self.viewport_scroll;
+            self.scroll_viewport_by(current.x, current.y);
+            return true;
+        }
+
+        false
     }
 
     /// Computes the size and position of the `Node` relative to the viewport
@@ -1590,6 +2080,24 @@ impl BaseDocument {
             let layout_ctx = &mut self.layout_ctx;
             let driver = text_input.editor.driver(&mut font_ctx, layout_ctx);
             cb(driver)
+        }
+    }
+
+    /// Recompute the scroll offset of the text input at `node_id` (if any) so that its caret
+    /// remains visible within the input's content box.
+    pub(crate) fn clamp_text_input_scroll(&mut self, node_id: usize) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+
+        let content_box_width = node.final_layout.content_box_width();
+        let content_box_height = node.final_layout.content_box_height();
+
+        if let Some(text_input) = node
+            .element_data_mut()
+            .and_then(|el| el.text_input_data_mut())
+        {
+            text_input.clamp_scroll_offset(content_box_width, content_box_height);
         }
     }
 
@@ -1883,5 +2391,78 @@ impl AsRef<BaseDocument> for BaseDocument {
 impl AsMut<BaseDocument> for BaseDocument {
     fn as_mut(&mut self) -> &mut BaseDocument {
         self
+    }
+}
+
+#[cfg(test)]
+mod font_face_override_tests {
+    use super::*;
+    use crate::net::{FontFaceOverrides, Resource, ResourceLoadResponse};
+
+    /// Regression-pin for the `@font-face` descriptor-honouring fix.
+    ///
+    /// The bug was that `Resource::Font` carried only the raw font bytes,
+    /// so `load_resource` registered fonts with `info_override = None` and
+    /// parley fell back to the TTF's internal `name` table. After the fix,
+    /// `Resource::Font` carries `FontFaceOverrides` and `load_resource`
+    /// builds a `FontInfoOverride` from them — meaning a CSS-declared
+    /// `font-family` alias wins over the file's own metadata.
+    ///
+    /// We drive `load_resource` directly with a fabricated response rather
+    /// than go through HTML parsing → `fetch_font_face`, because the
+    /// downstream HTML parser lives in `blitz-html` (would be a circular
+    /// crate dependency). The mapping from `@font-face` descriptors into
+    /// `FontFaceOverrides` is covered by the unit tests in `net.rs`; this
+    /// test pins the load-side of the pipeline.
+    #[test]
+    fn font_face_overrides_alias_family_name() {
+        const ALIAS: &str = "AliasedFamily";
+
+        let mut document = BaseDocument::new(DocumentConfig::default());
+
+        // Sanity: the alias name is not registered before we feed the font.
+        {
+            let mut ctx = document.font_ctx.lock().unwrap();
+            assert!(
+                ctx.collection.family_id(ALIAS).is_none(),
+                "alias must not exist before registration",
+            );
+        }
+
+        // Drive `load_resource` with a `Resource::Font` whose overrides
+        // assert the CSS-side family name. We use the bullet font as a
+        // valid font payload — its internal `name` table is irrelevant to
+        // the assertion; what matters is whether the override wins.
+        let response = ResourceLoadResponse {
+            request_id: 0,
+            node_id: None,
+            resolved_url: Some(String::from("test://aliased-family")),
+            result: Ok(Resource::Font(
+                blitz_traits::net::Bytes::from_static(crate::BULLET_FONT),
+                FontFaceOverrides {
+                    family_name: Some(String::from(ALIAS)),
+                    weight: Some(800.0),
+                    style: Some(parley::fontique::FontStyle::Italic),
+                },
+            )),
+        };
+        document.load_resource(response);
+
+        // The override must have taken effect: parley's `Collection` now
+        // resolves the CSS-declared alias to a registered family.
+        let mut ctx = document.font_ctx.lock().unwrap();
+        let family_id = ctx
+            .collection
+            .family_id(ALIAS)
+            .expect("CSS-declared family name should be registered as a family alias");
+        let resolved_name = ctx
+            .collection
+            .family_name(family_id)
+            .expect("family id should resolve back to a name");
+        assert_eq!(
+            resolved_name, ALIAS,
+            "registered family should report the CSS-declared name, \
+             not the font file's internal `name` table entry",
+        );
     }
 }

@@ -2,7 +2,7 @@
 use crate::NodeId;
 use crate::events::{
     BlitzKeyboardData, NativeConverter, NativeFocusData, NativeFormData, NativePointerData,
-    NativeScrollData, NativeWheelData, NodeHandle,
+    NativeScrollData, NativeTouchData, NativeWheelData, NodeHandle,
 };
 use crate::mutation_writer::{DioxusState, MutationWriter};
 use crate::qual_name;
@@ -277,6 +277,7 @@ impl EventHandler for DioxusEventHandler<'_> {
             DomEventData::PointerMove(mevent)
             | DomEventData::PointerDown(mevent)
             | DomEventData::PointerUp(mevent)
+            | DomEventData::PointerCancel(mevent)
             | DomEventData::PointerLeave(mevent)
             | DomEventData::PointerEnter(mevent)
             | DomEventData::PointerOver(mevent)
@@ -292,6 +293,13 @@ impl EventHandler for DioxusEventHandler<'_> {
             | DomEventData::ContextMenu(mevent)
             | DomEventData::DoubleClick(mevent) => {
                 Some(wrap_event_data(NativePointerData(mevent.clone())))
+            }
+
+            DomEventData::TouchStart(tevent)
+            | DomEventData::TouchMove(tevent)
+            | DomEventData::TouchEnd(tevent)
+            | DomEventData::TouchCancel(tevent) => {
+                Some(wrap_event_data(NativeTouchData(tevent.clone())))
             }
 
             DomEventData::Scroll(sevent) => Some(wrap_event_data(NativeScrollData(sevent.clone()))),
@@ -324,27 +332,74 @@ impl EventHandler for DioxusEventHandler<'_> {
             return;
         };
 
-        for &node_id in chain {
-            // Get dioxus vdom id for node
-            let dioxus_id = doc.inner().get_node(node_id).and_then(get_dioxus_id);
-            let Some(id) = dioxus_id else {
-                continue;
-            };
+        // Get dioxus vdom id for node
+        let dioxus_id = chain
+            .iter()
+            .find_map(|node_id| doc.inner().get_node(*node_id).and_then(get_dioxus_id));
+        let Some(id) = dioxus_id else {
+            return;
+        };
 
-            // Handle event in vdom
-            let dx_event = Event::new(event_data.clone(), event.bubbles);
-            self.vdom
-                .runtime()
-                .handle_event(event.name(), dx_event.clone(), id);
+        // Handle event in vdom
+        let dx_event = Event::new(event_data.clone(), event.bubbles);
+        self.vdom
+            .runtime()
+            .handle_event(event.name(), dx_event.clone(), id);
 
-            // Update event state
-            if !dx_event.default_action_enabled() {
-                event_state.prevent_default();
-            }
-            if !dx_event.propagates() {
-                event_state.stop_propagation();
-                break;
-            }
+        // Update event state
+        if !dx_event.default_action_enabled() {
+            event_state.prevent_default();
         }
+        if !dx_event.propagates() {
+            event_state.stop_propagation();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blitz_dom::DocumentConfig;
+    use dioxus::prelude::*;
+    use dioxus_core::ScopeId;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[test]
+    // Regression test for a panic. The keyed `div`s are re-ordered as the (unordered) `HashMap` grows,
+    // which previously caused a crash when moving keyed nodes within their parent.
+    fn keyed_nodes_do_not_crash() {
+        type SharedData = Rc<RefCell<HashMap<usize, usize>>>;
+        let data: SharedData = Rc::new(RefCell::new(HashMap::new()));
+
+        fn app(data: SharedData) -> Element {
+            let entries: Vec<usize> = data.borrow().keys().copied().collect();
+            rsx!(
+                for id in entries {
+                    div {
+                        key: "item_{id}",
+                        "{id}"
+                    }
+                }
+            )
+        }
+
+        let vdom = VirtualDom::new_with_props(app, Rc::clone(&data));
+        let mut doc = DioxusDocument::new(vdom, DocumentConfig::default());
+        doc.initial_build();
+
+        // Mirror `examples/crash.rs`: incrementally insert 100 items, flushing
+        // the resulting mutations after each insert.
+        for i in 0..100 {
+            data.borrow_mut().insert(i, i);
+            doc.vdom.mark_dirty(ScopeId::APP);
+            doc.poll(None);
+        }
+
+        // The `<main>` element should end up with exactly one keyed `div` per
+        // inserted item, and applying the mutations must not have panicked.
+        let inner = doc.inner.borrow();
+        let main = inner.get_node(doc.main_element_id).unwrap();
+        assert_eq!(main.children.len(), 100);
     }
 }

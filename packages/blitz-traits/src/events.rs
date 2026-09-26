@@ -1,10 +1,18 @@
 //! Types to represent UI and DOM events
 
 use std::str::FromStr;
+use std::sync::Arc;
 
+use atomic_refcell::AtomicRefCell;
 use bitflags::bitflags;
-use keyboard_types::{Code, Key, Location, Modifiers};
 use smol_str::SmolStr;
+
+// FTS: re-exported, not just imported, because the event structs below
+// are `pub` with `pub` fields of these types, and a crate implementing
+// `Widget` cannot name them otherwise — it would have to guess which
+// `keyboard_types` in the graph is the right one, and there is more
+// than one.
+pub use keyboard_types::{Code, Key, Location, Modifiers};
 
 #[derive(Default)]
 pub struct EventState {
@@ -59,6 +67,7 @@ pub enum UiEvent {
     PointerMove(BlitzPointerEvent),
     PointerUp(BlitzPointerEvent),
     PointerDown(BlitzPointerEvent),
+    PointerCancel(BlitzPointerEvent),
     Wheel(BlitzWheelEvent),
     KeyUp(BlitzKeyEvent),
     KeyDown(BlitzKeyEvent),
@@ -110,6 +119,7 @@ pub enum DomEventKind {
     PointerMove,
     PointerDown,
     PointerUp,
+    PointerCancel,
     PointerEnter,
     PointerLeave,
     PointerOver,
@@ -122,6 +132,11 @@ pub enum DomEventKind {
     MouseLeave,
     MouseOver,
     MouseOut,
+
+    TouchStart,
+    TouchMove,
+    TouchEnd,
+    TouchCancel,
 
     Scroll,
     Wheel,
@@ -155,6 +170,7 @@ impl FromStr for DomEventKind {
             "pointermove" => Ok(Self::PointerMove),
             "pointerdown" => Ok(Self::PointerDown),
             "pointerup" => Ok(Self::PointerUp),
+            "pointercancel" => Ok(Self::PointerCancel),
             "pointerenter" => Ok(Self::PointerEnter),
             "pointerleave" => Ok(Self::PointerLeave),
             "pointerover" => Ok(Self::PointerOver),
@@ -167,6 +183,11 @@ impl FromStr for DomEventKind {
             "mouseleave" => Ok(Self::MouseLeave),
             "mouseover" => Ok(Self::MouseOver),
             "mouseout" => Ok(Self::MouseOut),
+
+            "touchstart" => Ok(Self::TouchStart),
+            "touchmove" => Ok(Self::TouchMove),
+            "touchend" => Ok(Self::TouchEnd),
+            "touchcancel" => Ok(Self::TouchCancel),
 
             "scroll" => Ok(Self::Scroll),
             "wheel" => Ok(Self::Wheel),
@@ -196,6 +217,7 @@ pub enum DomEventData {
     PointerMove(BlitzPointerEvent),
     PointerDown(BlitzPointerEvent),
     PointerUp(BlitzPointerEvent),
+    PointerCancel(BlitzPointerEvent),
     PointerEnter(BlitzPointerEvent),
     PointerLeave(BlitzPointerEvent),
     PointerOver(BlitzPointerEvent),
@@ -208,6 +230,11 @@ pub enum DomEventData {
     MouseLeave(BlitzPointerEvent),
     MouseOver(BlitzPointerEvent),
     MouseOut(BlitzPointerEvent),
+
+    TouchStart(BlitzPointerEvent),
+    TouchMove(BlitzPointerEvent),
+    TouchEnd(BlitzPointerEvent),
+    TouchCancel(BlitzPointerEvent),
 
     Scroll(BlitzScrollEvent),
     Wheel(BlitzWheelEvent),
@@ -245,6 +272,7 @@ impl DomEventData {
             Self::PointerMove { .. } => "pointermove",
             Self::PointerDown { .. } => "pointerdown",
             Self::PointerUp { .. } => "pointerup",
+            Self::PointerCancel { .. } => "pointercancel",
             Self::PointerEnter { .. } => "pointerenter",
             Self::PointerLeave { .. } => "pointerleave",
             Self::PointerOver { .. } => "pointerover",
@@ -257,6 +285,11 @@ impl DomEventData {
             Self::MouseLeave { .. } => "mouseleave",
             Self::MouseOver { .. } => "mouseover",
             Self::MouseOut { .. } => "mouseout",
+
+            Self::TouchStart { .. } => "touchstart",
+            Self::TouchMove { .. } => "touchmove",
+            Self::TouchEnd { .. } => "touchend",
+            Self::TouchCancel { .. } => "touchcancel",
 
             Self::Scroll { .. } => "scroll",
             Self::Wheel { .. } => "wheel",
@@ -285,6 +318,7 @@ impl DomEventData {
             Self::PointerMove { .. } => DomEventKind::PointerMove,
             Self::PointerDown { .. } => DomEventKind::PointerDown,
             Self::PointerUp { .. } => DomEventKind::PointerUp,
+            Self::PointerCancel { .. } => DomEventKind::PointerCancel,
             Self::PointerEnter { .. } => DomEventKind::PointerEnter,
             Self::PointerLeave { .. } => DomEventKind::PointerLeave,
             Self::PointerOver { .. } => DomEventKind::PointerOver,
@@ -297,6 +331,11 @@ impl DomEventData {
             Self::MouseLeave { .. } => DomEventKind::MouseLeave,
             Self::MouseOver { .. } => DomEventKind::MouseOver,
             Self::MouseOut { .. } => DomEventKind::MouseOut,
+
+            Self::TouchStart { .. } => DomEventKind::TouchStart,
+            Self::TouchMove { .. } => DomEventKind::TouchMove,
+            Self::TouchEnd { .. } => DomEventKind::TouchEnd,
+            Self::TouchCancel { .. } => DomEventKind::TouchCancel,
 
             Self::Scroll { .. } => DomEventKind::Scroll,
             Self::Wheel { .. } => DomEventKind::Wheel,
@@ -325,6 +364,7 @@ impl DomEventData {
             Self::PointerMove { .. } => true,
             Self::PointerDown { .. } => true,
             Self::PointerUp { .. } => true,
+            Self::PointerCancel { .. } => false,
             Self::PointerEnter { .. } => false,
             Self::PointerLeave { .. } => false,
             Self::PointerOver { .. } => true,
@@ -337,6 +377,11 @@ impl DomEventData {
             Self::MouseLeave { .. } => false,
             Self::MouseOver { .. } => true,
             Self::MouseOut { .. } => true,
+
+            Self::TouchStart { .. } => true,
+            Self::TouchMove { .. } => true,
+            Self::TouchEnd { .. } => true,
+            Self::TouchCancel { .. } => false,
 
             Self::Scroll { .. } => false,
             Self::Wheel { .. } => true,
@@ -365,6 +410,7 @@ impl DomEventData {
             Self::PointerMove { .. } => true,
             Self::PointerDown { .. } => true,
             Self::PointerUp { .. } => true,
+            Self::PointerCancel { .. } => true,
             Self::PointerEnter { .. } => false,
             Self::PointerLeave { .. } => false,
             Self::PointerOver { .. } => true,
@@ -377,6 +423,11 @@ impl DomEventData {
             Self::MouseLeave { .. } => false,
             Self::MouseOver { .. } => true,
             Self::MouseOut { .. } => true,
+
+            Self::TouchStart { .. } => true,
+            Self::TouchMove { .. } => true,
+            Self::TouchEnd { .. } => true,
+            Self::TouchCancel { .. } => true,
 
             Self::Scroll { .. } => false,
             Self::Wheel { .. } => true,
@@ -413,7 +464,7 @@ pub struct HitResult {
     pub y: f32,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BlitzPointerId {
     Mouse,
     Pen,
@@ -441,6 +492,12 @@ pub struct PointerDetails {
     pub azimuth: f64,
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Point<T> {
+    pub x: T,
+    pub y: T,
+}
+
 #[derive(Clone, Debug)]
 pub struct BlitzPointerEvent {
     pub id: BlitzPointerId,
@@ -450,6 +507,18 @@ pub struct BlitzPointerEvent {
     pub buttons: MouseEventButtons,
     pub mods: Modifiers,
     pub details: PointerDetails,
+    pub element: Point<f32>,
+    /// All pointers that are currently active (pressed) on the surface, including
+    /// the one that triggered this event.
+    ///
+    /// This is shared via [`Arc`] so that it can be cheaply cloned into each
+    /// dispatched event and cheaply mutated as pointers are pressed, moved and
+    /// released. It is primarily used to populate the `touches` list of touch
+    /// events (multi-touch support).
+    ///
+    /// The events stored in this list always have an empty `active_pointers`
+    /// list themselves, to avoid a reference cycle.
+    pub active_pointers: Arc<AtomicRefCell<Vec<BlitzPointerEvent>>>,
 }
 
 impl BlitzPointerEvent {
@@ -490,6 +559,15 @@ impl BlitzPointerEvent {
     pub fn screen_y(&self) -> f32 {
         self.coords.screen_y
     }
+
+    #[inline(always)]
+    pub fn element_x(&self) -> f32 {
+        self.element.x
+    }
+    #[inline(always)]
+    pub fn element_y(&self) -> f32 {
+        self.element.y
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -504,6 +582,7 @@ pub struct BlitzWheelEvent {
     pub coords: PointerCoords,
     pub buttons: MouseEventButtons,
     pub mods: Modifiers,
+    pub element: Point<f32>,
 }
 
 impl BlitzWheelEvent {
@@ -530,6 +609,14 @@ impl BlitzWheelEvent {
     #[inline(always)]
     pub fn screen_y(&self) -> f32 {
         self.coords.screen_y
+    }
+    #[inline(always)]
+    pub fn element_x(&self) -> f32 {
+        self.element.x
+    }
+    #[inline(always)]
+    pub fn element_y(&self) -> f32 {
+        self.element.y
     }
 }
 
@@ -655,7 +742,7 @@ pub enum BlitzImeEvent {
     ///
     /// After getting this event you could receive [`Preedit`][Self::Preedit] and
     /// [`Commit`][Self::Commit] events. You should also start performing IME related requests
-    /// like [`Window::set_ime_cursor_area`].
+    /// like `Window::set_ime_cursor_area`.
     Enabled,
 
     /// Notifies when a new composing text should be set at the cursor position.
@@ -690,7 +777,7 @@ pub enum BlitzImeEvent {
     ///
     /// After receiving this event you won't get any more [`Preedit`][Self::Preedit] or
     /// [`Commit`][Self::Commit] events until the next [`Enabled`][Self::Enabled] event. You should
-    /// also stop issuing IME related requests like [`Window::set_ime_cursor_area`] and clear
+    /// also stop issuing IME related requests like `Window::set_ime_cursor_area` and clear
     /// pending preedit text.
     Disabled,
 }

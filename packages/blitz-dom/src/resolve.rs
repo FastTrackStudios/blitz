@@ -6,6 +6,7 @@ use std::{
 };
 
 use debug_timer::debug_timer;
+use kurbo::{Affine, Rect};
 use parley::LayoutContext;
 use selectors::Element as _;
 use style::dom::TDocument;
@@ -19,17 +20,17 @@ thread_local! {
     pub(crate) static LAYOUT_CTX: RefCell<Option<Box<LayoutContext<TextBrush>>>> = const { RefCell::new(None) };
 }
 
-#[cfg(feature = "incremental")]
 use style::selector_parser::RestyleDamage;
 use taffy::AvailableSpace;
 
 use crate::{
-    BaseDocument, NON_INCREMENTAL,
+    BaseDocument,
     events::ScrollAnimationState,
     layout::{
         construct::{
             ConstructionTask, ConstructionTaskData, ConstructionTaskResult,
-            ConstructionTaskResultData, build_inline_layout_into, collect_layout_children,
+            ConstructionTaskResultData, LayoutChildren, build_inline_layout_into,
+            collect_layout_children,
         },
         damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
     },
@@ -38,7 +39,16 @@ use crate::{
 
 impl BaseDocument {
     /// Restyle the tree and then relayout it
+    /// [`resolve`](Self::resolve) again at the animation time of the last
+    /// resolve: for bringing layout up to date between frames (an input
+    /// event arriving after mutations, before the frame that would resolve
+    /// them) without moving animations off the window's clock.
+    pub fn resolve_at_last_time(&mut self) {
+        self.resolve(self.last_animation_time);
+    }
+
     pub fn resolve(&mut self, current_time_for_animations: f64) {
+        self.last_animation_time = current_time_for_animations;
         if TDocument::as_node(&&self.nodes[0])
             .first_element_child()
             .is_none()
@@ -53,18 +63,26 @@ impl BaseDocument {
 
         self.resolve_scroll_animation();
 
+        // Drop scrollbar-activity entries whose fade-out has finished (also
+        // sheds entries for removed nodes).
+        {
+            use crate::node::scrollbar::{FADE_DELAY, FADE_DURATION};
+            self.scrollbar_activity
+                .retain(|_, last| last.elapsed() < FADE_DELAY + FADE_DURATION);
+        }
+
         let root_node_id = self.root_element().id;
-        debug_timer!(timer, feature = "log_phase_times");
+        debug_timer!(timer, feature = "log-phase-times");
 
         // we need to resolve stylist first since it will need to drive our layout bits
         self.resolve_stylist(current_time_for_animations);
         timer.record_time("style");
 
         // Propagate damage flags (from mutation and restyles) up and down the tree
-        #[cfg(feature = "incremental")]
-        self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
-        #[cfg(feature = "incremental")]
-        timer.record_time("damage");
+        if self.incremental_layout {
+            self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
+            timer.record_time("damage");
+        }
 
         // Fix up tree for layout (insert anonymous blocks as necessary, etc)
         self.resolve_layout_children();
@@ -81,9 +99,11 @@ impl BaseDocument {
         self.resolve_layout();
         timer.record_time("layout");
 
+        self.resolve_transforms(root_node_id);
+        timer.record_time("transform");
+
         // Clear all damage and dirty flags
-        #[cfg(feature = "incremental")]
-        {
+        if self.incremental_layout {
             for (_, node) in self.nodes.iter_mut() {
                 node.clear_damage_mut();
                 node.unset_dirty_descendants();
@@ -119,6 +139,59 @@ impl BaseDocument {
         timer.record_time("subdocs");
 
         timer.print_times(&format!("Resolve({}): ", self.id()));
+    }
+
+    fn resolve_transforms(&mut self, node_id: usize) -> Rect {
+        if !self.nodes.contains(node_id) {
+            return Rect::ZERO;
+        }
+
+        if !self.nodes[node_id]
+            .damage()
+            .map(|d| d.contains(style::selector_parser::RestyleDamage::RECALCULATE_OVERFLOW))
+            .unwrap_or(false)
+        {
+            return self.nodes[node_id].scrollable_overflow;
+        }
+
+        let scale = self.viewport.scale_f64();
+
+        let transform = self.nodes[node_id].set_transform(scale as f32);
+
+        let w = self.nodes[node_id].final_layout.size.width as f64 * scale;
+        let h = self.nodes[node_id].final_layout.size.height as f64 * scale;
+        let mut overflow = Rect::new(0.0, 0.0, w, h);
+
+        let layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
+
+        if let Some(ref children) = layout_children {
+            for &child_id in children {
+                let child_rect_in_self = self.resolve_transforms(child_id);
+                overflow = overflow.union(child_rect_in_self);
+            }
+        }
+        if let Some(before) = self.nodes[node_id].before {
+            let child_rect_in_self = self.resolve_transforms(before);
+            overflow = overflow.union(child_rect_in_self);
+        }
+        if let Some(after) = self.nodes[node_id].after {
+            let child_rect_in_self = self.resolve_transforms(after);
+            overflow = overflow.union(child_rect_in_self);
+        }
+
+        self.nodes[node_id].scrollable_overflow = overflow;
+        *self.nodes[node_id].layout_children.get_mut() = layout_children;
+
+        let scaled_x = self.nodes[node_id].final_layout.location.x as f64 * scale;
+        let scaled_y = self.nodes[node_id].final_layout.location.y as f64 * scale;
+
+        let full = if let Some(t) = transform {
+            Affine::translate((scaled_x, scaled_y)) * t
+        } else {
+            Affine::translate((scaled_x, scaled_y))
+        };
+
+        full.transform_rect_bbox(overflow)
     }
 
     pub fn resolve_scroll_animation(&mut self) {
@@ -167,11 +240,11 @@ impl BaseDocument {
             let mut damage = doc.nodes[node_id].damage().unwrap_or(ALL_DAMAGE);
             let _flags = doc.nodes[node_id].flags;
 
-            if NON_INCREMENTAL || damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX) {
+            if !doc.incremental_layout || damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX) {
                 //} || flags.contains(NodeFlags::IS_INLINE_ROOT) {
-                let mut layout_children = Vec::new();
-                let mut anonymous_block: Option<usize> = None;
-                collect_layout_children(doc, node_id, &mut layout_children, &mut anonymous_block);
+                let mut collected = LayoutChildren::default();
+                collect_layout_children(doc, node_id, &mut collected);
+                let layout_children = collected.children;
 
                 // Recurse into newly collected layout children
                 for child_id in layout_children.iter().copied() {
@@ -309,6 +382,13 @@ impl BaseDocument {
         // println!("\n\nRESOLVE LAYOUT\n===========\n");
 
         taffy::compute_root_layout(self, root_element_id, available_space);
+        // Rounding walks the whole tree and is 6% of a frame on a big
+        // one, but it cannot be skipped on the grounds that nothing was
+        // damaged: `compute_root_layout` rewrites unrounded layouts for
+        // anything its cache missed, and `final_layout` is only ever
+        // written here. Skipping it left the window laying out at zero
+        // size. Making this incremental means teaching Taffy to report
+        // which nodes it actually recomputed.
         taffy::round_layout(self, root_element_id);
 
         // println!("\n\n");

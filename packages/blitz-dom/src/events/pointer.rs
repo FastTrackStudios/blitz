@@ -1,7 +1,6 @@
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::VecDeque;
+
+use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blitz_traits::{
     events::{
@@ -12,8 +11,13 @@ use blitz_traits::{
 };
 use keyboard_types::Modifiers;
 use markup5ever::local_name;
+use style::values::computed::UserSelect;
+use taffy::AbsoluteAxis;
 
-use crate::{BaseDocument, node::SpecialElementData};
+use crate::{
+    BaseDocument,
+    node::{ScrollbarRef, SpecialElementData},
+};
 
 use super::focus::generate_focus_events;
 
@@ -46,6 +50,14 @@ pub(crate) struct PanSample {
     pub(crate) dy: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScrollbarDragState {
+    /// The thumb being dragged
+    pub(crate) scrollbar: ScrollbarRef,
+    /// Last pointer position along the drag axis, in page coordinates
+    pub(crate) last_pos: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DragMode {
     /// We are not currently dragging
@@ -54,6 +66,8 @@ pub(crate) enum DragMode {
     Selecting,
     /// We are currently panning the document with a drag (probably touch)
     Panning(PanState),
+    /// We are currently dragging a scrollbar thumb
+    ScrollbarDrag(ScrollbarDragState),
 }
 
 impl DragMode {
@@ -157,7 +171,39 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
         if dx.abs() > 2.0 || dy.abs() > 2.0 {
             match event.id {
                 BlitzPointerId::Mouse | BlitzPointerId::Pen => {
-                    doc.drag_mode = DragMode::Selecting;
+                    // `mousedown_node_id` is remembered from a previous
+                    // event, so by the time the pointer moves the node it
+                    // names may be gone: anything that re-renders between the
+                    // press and the drag replaces it, and a custom widget
+                    // that rebuilds its subtree while being dragged does
+                    // exactly that. Indexing the slab with the stale id
+                    // panics with `invalid key`, on a pointer move, far from
+                    // whatever removed the node — so it reads as a bug in
+                    // whichever component is on screen. There is no selection
+                    // to start from a node that no longer exists.
+                    if let Some(mousedown_node_id) = doc.mousedown_node_id
+                        && let Some(node) = doc.nodes.get(mousedown_node_id)
+                    {
+                        if let Some(style) = node.primary_styles() {
+                            let user_select = style.clone_user_select();
+                            if user_select == UserSelect::None {
+                                // Do nothing. Continue with rest of function
+                            } else if user_select == UserSelect::Auto {
+                                if let Some(parent) = node.parent
+                                    && let Some(node) = doc.nodes.get(parent)
+                                {
+                                    if let Some(style) = node.primary_styles() {
+                                        let user_select = style.clone_user_select();
+                                        if user_select == UserSelect::None {
+                                            // Do nothing. Continue with rest of function
+                                        } else {
+                                            doc.drag_mode = DragMode::Selecting;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 BlitzPointerId::Finger(_) => {
                     doc.drag_mode = DragMode::Panning(PanState {
@@ -184,6 +230,26 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
         return has_changed;
     }
 
+    if let DragMode::ScrollbarDrag(state) = &mut doc.drag_mode {
+        let ScrollbarRef { node_id, axis } = state.scrollbar;
+        let pos = match axis {
+            AbsoluteAxis::Horizontal => x,
+            AbsoluteAxis::Vertical => y,
+        };
+        let delta_px = (pos - state.last_pos) as f64;
+        state.last_pos = pos;
+
+        // Thumb px -> content px. scroll_by uses wheel-delta semantics
+        // (positive delta decreases the offset), so negate.
+        let ratio = doc.nodes[node_id].scrollbar_drag_ratio(axis);
+        let (dx, dy) = match axis {
+            AbsoluteAxis::Horizontal => (-delta_px * ratio, 0.0),
+            AbsoluteAxis::Vertical => (0.0, -delta_px * ratio),
+        };
+        let has_changed = doc.scroll_by(Some(node_id), dx, dy, &mut dispatch_event);
+        return has_changed;
+    }
+
     let Some(hit) = doc.hit(x, y) else {
         return changed;
     };
@@ -202,7 +268,10 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
     let node = &mut doc.nodes[target];
     let Some(el) = node.data.downcast_element_mut() else {
         // Handle text selection extension for non-element nodes
-        if buttons != MouseEventButtons::None && doc.extend_text_selection_to_point(x, y) {
+        if buttons != MouseEventButtons::None
+            && doc.drag_mode == DragMode::Selecting
+            && doc.extend_text_selection_to_point(x, y)
+        {
             changed = true;
         }
         return changed;
@@ -231,8 +300,17 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
             content_box_offset.y += y_offset;
         }
 
-        let x = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
-        let y = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
+        // Account for the input's scroll offset (stored in CSS pixels, scaled here to device
+        // pixels) when mapping the pointer location into the text content's coordinate space.
+        let scroll_offset = text_input_data.scroll_offset as f64 * doc.viewport.scale_f64();
+        let (scroll_x, scroll_y) = if text_input_data.is_multiline {
+            (0.0, scroll_offset)
+        } else {
+            (scroll_offset, 0.0)
+        };
+
+        let x = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64() + scroll_x;
+        let y = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64() + scroll_y;
 
         text_input_data
             .editor
@@ -242,6 +320,7 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
         changed = true;
     } else if event.is_mouse()
         && buttons != MouseEventButtons::None
+        && doc.drag_mode == DragMode::Selecting
         && doc.extend_text_selection_to_point(x, y)
     {
         changed = true;
@@ -255,6 +334,7 @@ pub(crate) fn handle_pointerdown(
     _target: usize,
     x: f32,
     y: f32,
+    button: MouseEventButton,
     mods: Modifiers,
     dispatch_event: &mut dyn FnMut(DomEvent),
 ) {
@@ -285,6 +365,25 @@ pub(crate) fn handle_pointerdown(
         return;
     };
 
+    // Scrollbar thumb drags take precedence over content interactions and
+    // are not dispatched to the page (matching native scrollbars). A
+    // faded-out thumb doesn't capture: the click goes to the content.
+    if button == MouseEventButton::Main {
+        if let (_, Some(scrollbar)) = doc.hit_with_scrollbar(x, y)
+            && doc.scrollbar_opacity(scrollbar.node_id) > 0.0
+        {
+            doc.drag_mode = DragMode::ScrollbarDrag(ScrollbarDragState {
+                scrollbar,
+                last_pos: match scrollbar.axis {
+                    AbsoluteAxis::Horizontal => x,
+                    AbsoluteAxis::Vertical => y,
+                },
+            });
+            doc.shell_provider.request_redraw();
+            return;
+        }
+    }
+
     // Use hit.node_id for determining the actual clicked element.
     // This may differ from `target` for anonymous blocks (which are layout children
     // but not DOM children), so we use the hit result for text selection.
@@ -294,6 +393,8 @@ pub(crate) fn handle_pointerdown(
     enum ClickTarget {
         TextInput {
             content_box_offset: taffy::Point<f32>,
+            /// Scroll offset of the input along each axis, in scaled (device) pixels.
+            scroll: taffy::Point<f64>,
         },
         Disabled,
         SelectableText,
@@ -316,7 +417,25 @@ pub(crate) fn handle_pointerdown(
                         let y_offset = ((content_box_height - input_height) / 2.0).max(0.0);
                         content_box_offset.y += y_offset;
                     }
-                    ClickTarget::TextInput { content_box_offset }
+                    // `scroll_offset` is stored in CSS pixels; scale it to device pixels to
+                    // match the editor's coordinate space.
+                    let scroll_offset =
+                        text_input_data.scroll_offset as f64 * doc.viewport.scale_f64();
+                    let scroll = if text_input_data.is_multiline {
+                        taffy::Point {
+                            x: 0.0,
+                            y: scroll_offset,
+                        }
+                    } else {
+                        taffy::Point {
+                            x: scroll_offset,
+                            y: 0.0,
+                        }
+                    };
+                    ClickTarget::TextInput {
+                        content_box_offset,
+                        scroll,
+                    }
                 } else {
                     ClickTarget::SelectableText
                 }
@@ -336,12 +455,15 @@ pub(crate) fn handle_pointerdown(
                 doc.clear_text_selection();
             }
         }
-        ClickTarget::TextInput { content_box_offset } => {
+        ClickTarget::TextInput {
+            content_box_offset,
+            scroll,
+        } => {
             // Clear general text selection when focusing a text input
             doc.clear_text_selection();
 
-            let tx = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
-            let ty = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
+            let tx = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64() + scroll.x;
+            let ty = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64() + scroll.y;
 
             // Now get mutable access to the text input
             let click_count = doc.click_count;
@@ -367,16 +489,36 @@ pub(crate) fn handle_pointerdown(
 
                 drop(font_ctx);
             }
-
-            generate_focus_events(
-                doc,
-                &mut |doc| {
-                    doc.set_focus_to(hit.node_id);
-                },
-                dispatch_event,
-            );
         }
     }
+
+    // FTS: focus follows pointerdown for ALL content, not just text
+    // inputs — walk from the hit node to the nearest focussable
+    // ancestor (tabindex >= 0, inputs, links, ...) and focus it;
+    // clear focus when the click lands on non-focusable content.
+    // Upstream only focused text inputs here, which made
+    // contenteditable-style widgets (tabindex="0" divs, e.g. the FTS
+    // editor root) unfocusable by mouse. Matches browser behavior.
+    let focus_target = {
+        let mut cur = Some(hit.node_id);
+        while let Some(id) = cur {
+            if doc.nodes[id].is_focussable() {
+                break;
+            }
+            cur = doc.nodes[id].parent;
+        }
+        cur
+    };
+    generate_focus_events(
+        doc,
+        &mut |doc| match focus_target {
+            Some(id) => {
+                doc.set_focus_to(id);
+            }
+            None => doc.clear_focus(),
+        },
+        dispatch_event,
+    );
 }
 
 pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
@@ -404,6 +546,13 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
     // Don't dispatch click if we were doing a text selection drag or panning
     // the document with a touch
     let do_click = drag_mode == DragMode::None;
+
+    // Repaint so a dragged scrollbar thumb drops its active styling, and
+    // restart its fade-out delay now that the drag no longer holds it shown
+    if let DragMode::ScrollbarDrag(state) = &drag_mode {
+        doc.show_scrollbars(state.scrollbar.node_id);
+        doc.shell_provider.request_redraw();
+    }
 
     let time_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -461,6 +610,10 @@ pub(crate) fn handle_click(
                 break 'matched true;
             }
 
+            // FTS: read now, acted on after the element's own click
+            // behaviour below (see there).
+            let focussable = el.is_focussable;
+
             match el.name.local {
                 local_name!("input") if el.attr(local_name!("type")) == Some("checkbox") => {
                     let is_checked = BaseDocument::toggle_checkbox(el);
@@ -479,8 +632,11 @@ pub(crate) fn handle_click(
                     break 'matched true;
                 }
                 local_name!("input") if el.attr(local_name!("type")) == Some("radio") => {
-                    let radio_set = el.attr(local_name!("name")).unwrap().to_string();
-                    BaseDocument::toggle_radio(doc, radio_set, node_id);
+                    if let Some(radio_set) = el.attr(local_name!("name")).map(str::to_string) {
+                        BaseDocument::toggle_radio(doc, radio_set, node_id);
+                    } else if let Some(is_checked) = el.checkbox_input_checked_mut() {
+                        *is_checked = true;
+                    }
 
                     // TODO: make input event conditional on value actually changing
                     let value = String::from("true");
@@ -499,6 +655,33 @@ pub(crate) fn handle_click(
 
                     break 'matched true;
                 }
+                // Activating the first <summary> of a <details> element toggles
+                // the details' `open` attribute (expand/collapse).
+                local_name!("summary") => {
+                    if let Some(parent_id) = doc.nodes[node_id].parent {
+                        let parent = &doc.nodes[parent_id];
+                        let is_first_summary = parent
+                            .data
+                            .is_element_with_tag_name(&local_name!("details"))
+                            && parent.children.iter().copied().find(|&child_id| {
+                                doc.nodes[child_id]
+                                    .data
+                                    .is_element_with_tag_name(&local_name!("summary"))
+                            }) == Some(node_id);
+
+                        if is_first_summary {
+                            doc.toggle_details_open(parent_id);
+                            generate_focus_events(
+                                doc,
+                                &mut |doc| {
+                                    doc.set_focus_to(node_id);
+                                },
+                                dispatch_event,
+                            );
+                            break 'matched true;
+                        }
+                    }
+                }
                 // Clicking labels triggers click, and possibly input event, of associated input
                 local_name!("label") => {
                     if let Some(target_node_id) =
@@ -512,13 +695,21 @@ pub(crate) fn handle_click(
                     }
                 }
                 local_name!("a") => {
-                    if let Some(href) = el.attr(local_name!("href")) {
-                        if let Some(url) = doc.url.resolve_relative(href) {
-                            doc.navigation_provider.navigate_to(NavigationOptions::new(
-                                url,
-                                None,
-                                doc.id(),
-                            ));
+                    if let Some(href) = el.attr(local_name!("href")).map(str::to_string) {
+                        if let Some(url) = doc.url.resolve_relative(&href) {
+                            // If the link only differs from the current document URL by its
+                            // fragment (this includes links whose href is just `#fragment`),
+                            // perform in-page fragment navigation (scrolling) instead of a
+                            // full navigation.
+                            if url.fragment().is_some() && doc.url.is_same_document(&url) {
+                                doc.scroll_to_fragment(url.fragment().unwrap_or_default());
+                            } else {
+                                doc.navigation_provider.navigate_to(NavigationOptions::new(
+                                    url,
+                                    None,
+                                    doc.id(),
+                                ));
+                            }
                         } else {
                             #[cfg(feature = "tracing")]
                             tracing::warn!("{href} is not parseable as a url. : {:?}", *doc.url);
@@ -536,7 +727,7 @@ pub(crate) fn handle_click(
                         doc.submit_form(*form_owner, node_id);
                     }
                 }
-                #[cfg(feature = "file_input")]
+                #[cfg(feature = "file-input")]
                 local_name!("input") if el.attr(local_name!("type")) == Some("file") => {
                     use crate::qual_name;
                     //TODO: Handle accept attribute https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/accept by passing an appropriate filter
@@ -572,6 +763,20 @@ pub(crate) fn handle_click(
                     text_data.content = text_content;
                 }
                 _ => {}
+            }
+
+            // FTS: a focussable element (tabindex >= 0 — e.g. a
+            // contenteditable-style editor root) counts as a match, so
+            // the "nothing matched -> clear focus" fallback below does
+            // NOT strip the focus that pointerdown just gave it. Without
+            // this, clicking such a widget focuses it on pointerdown and
+            // immediately blurs it on the click event, leaving keyboard
+            // input routed to the document root (dead keys). After the
+            // element's own behaviour, not before: a focussable element
+            // with a default action of its own (a <summary> toggling its
+            // <details>) must still perform it.
+            if focussable {
+                break 'matched true;
             }
 
             // No match. Recurse up to parent.

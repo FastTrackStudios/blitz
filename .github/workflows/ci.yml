@@ -24,17 +24,17 @@ jobs:
   # We only run `cargo build` (not `cargo test`) so as to avoid requiring dev-dependencies to build with the MSRV
   # version. Building is likely sufficient as runtime errors varying between rust versions is very unlikely.
   build-msrv:
-    name: "MSRV Build [Rust 1.92]"
+    name: "MSRV Build [Rust 1.89]"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.92
+          toolchain: 1.89
       - run: perl -pi.bak -e 's/opt-level = 2/opt-level = 0/g' Cargo.toml
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libgtk-3-dev libxdo-dev
+          packages: libfontconfig-dev
           version: 1.0
       - run: cargo build --workspace
 
@@ -47,7 +47,7 @@ jobs:
       - run: perl -pi.bak -e 's/opt-level = 2/opt-level = 0/g' Cargo.toml
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libgtk-3-dev libxdo-dev
+          packages: libfontconfig-dev
           version: 1.0
       - run: cargo build --workspace
 
@@ -60,9 +60,9 @@ jobs:
       - run: perl -pi.bak -e 's/opt-level = 2/opt-level = 0/g' Cargo.toml
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libgtk-3-dev libxdo-dev
+          packages: libfontconfig-dev
           version: 1.0
-      - run: cargo build -p readme --features incremental
+      - run: cargo build -p rdme --features incremental
 
   test-features-default:
     name: "Test [default features]"
@@ -73,7 +73,7 @@ jobs:
       - run: perl -pi.bak -e 's/opt-level = 2/opt-level = 0/g' Cargo.toml
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libgtk-3-dev libxdo-dev
+          packages: libfontconfig-dev
           version: 1.0
       - run: cargo test --workspace
 
@@ -86,9 +86,28 @@ jobs:
       - run: perl -pi.bak -e 's/opt-level = 2/opt-level = 0/g' Cargo.toml
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libgtk-3-dev libxdo-dev
+          packages: libfontconfig-dev
           version: 1.0
       - run: cargo build -p counter
+
+  # wasm_hello is a standalone workspace; seven_guis and todomvc are workspace
+  # members with a [lib] crate-type = ["cdylib"] target for wasm.
+  build-wasm-examples:
+    name: "Build wasm examples"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: Build wasm_hello
+        run: cargo build --target wasm32-unknown-unknown
+        working-directory: examples/wasm_hello
+      - name: Build seven_guis (wasm)
+        run: cargo build -p seven_guis --lib --target wasm32-unknown-unknown --no-default-features --features hybrid
+      - name: Build todomvc (wasm)
+        run: cargo build -p todomvc --lib --target wasm32-unknown-unknown --no-default-features --features hybrid
 
   fmt:
     name: Rustfmt
@@ -113,7 +132,7 @@ jobs:
       - run: perl -pi.bak -e 's/opt-level = 2/opt-level = 0/g' Cargo.toml
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libgtk-3-dev libxdo-dev
+          packages: libfontconfig-dev
           version: 1.0
       - run: cargo clippy --workspace -- -D warnings
 
@@ -125,7 +144,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo doc
 
-  # just cargo check for now
   matrix_test:
     runs-on: ${{ matrix.platform.os }}
     env:
@@ -193,29 +211,26 @@ jobs:
         if: ${{ matrix.platform.cross == true }}
         run: cargo install cross --git https://github.com/cross-rs/cross --rev 426e811
 
-      # This is currently disabled as Blitz's CI doesn't need the extra disk space.
-      # So this task is just taking up time for no reason. We will reinstate if our
-      # disk space requirement increase.
-      #
-      # - name: Free Disk Space (Ubuntu)
-      #   if: ${{ matrix.platform.os == 'ubuntu-latest' }}
-      #   uses: jlumbroso/free-disk-space@v1.3.1
-      #   with: # speed things up a bit
-      #     large-packages: false
-      #     docker-images: false
-      #     swap-storage: false
+      - name: Free Disk Space (Ubuntu)
+        if: ${{ matrix.platform.os == 'ubuntu-24.04' || matrix.platform.os == 'ubuntu-24.04-arm' }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with: # speed things up a bit
+          android: ${{ matrix.platform.target != 'aarch64-linux-android' }}
+          large-packages: false
+          swap-storage: false
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: "${{ matrix.platform.target }}"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: ${{ matrix.platform.os != 'macos-latest' }} # works around https://github.com/Swatinem/rust-cache/issues/341
 
       - name: Install apt deps
         if: ${{ matrix.platform.os == 'ubuntu-latest' }}
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: libasound2-dev libatk1.0-dev libgtk-3-dev libudev-dev libpango1.0-dev libxdo-dev libssl-dev
+          packages: libfontconfig1-dev
           version: 1.0
 
       - name: Setup

@@ -4,7 +4,7 @@ use anyrender::PaintScene;
 use kurbo::{Rect, Vec2};
 use peniko::{Compose, Fill, Mix};
 
-impl ElementCx<'_> {
+impl ElementCx<'_, '_> {
     pub(super) fn draw_outset_box_shadow(&self, scene: &mut impl PaintScene) {
         let box_shadow = &self.style.get_effects().box_shadow.0;
         let has_outset_shadow = box_shadow.iter().any(|s| !s.inset);
@@ -41,6 +41,8 @@ impl ElementCx<'_> {
             1.0,
             self.transform,
             &self.frame.shadow_clip(max_shadow_rect),
+            None,
+            None,
             |scene| {
                 for shadow in box_shadow.iter().filter(|s| !s.inset).rev() {
                     let shadow_color = shadow
@@ -103,7 +105,7 @@ impl ElementCx<'_> {
                 y: shadow.base.vertical.px() as f64,
             });
 
-            scene.push_layer(Mix::Normal, 1.0, self.transform, &padding_box);
+            scene.push_layer(Mix::Normal, 1.0, self.transform, &padding_box, None, None);
             scene.fill(
                 Fill::NonZero,
                 self.transform,
@@ -112,7 +114,14 @@ impl ElementCx<'_> {
                 &padding_box,
             );
 
-            scene.push_layer(Compose::DestOut, 1.0, self.transform, &padding_box);
+            scene.push_layer(
+                Compose::DestOut,
+                1.0,
+                self.transform,
+                &padding_box,
+                None,
+                None,
+            );
             scene.draw_box_shadow(
                 transform,
                 self.frame.border_box,

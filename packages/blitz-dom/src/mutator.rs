@@ -10,7 +10,6 @@ use crate::util::ImageType;
 use crate::{
     Attribute, BaseDocument, Document, ElementData, Node, NodeData, QualName, local_name, qual_name,
 };
-use blitz_traits::net::Request;
 use blitz_traits::shell::Viewport;
 use style::Atom;
 use style::invalidation::element::restyle_hints::RestyleHint;
@@ -37,6 +36,8 @@ enum SpecialOp {
     LoadCustomPaintSource(usize),
     ProcessButtonInput(usize),
     UnloadSubDocument(usize),
+    #[cfg(feature = "custom-widget")]
+    UnloadCustomWidget(usize),
 }
 
 pub struct DocumentMutator<'doc> {
@@ -213,33 +214,45 @@ impl DocumentMutator<'_> {
     }
 
     pub fn set_attribute(&mut self, node_id: usize, name: QualName, value: &str) {
-        self.doc.snapshot_node(node_id);
+        let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        if node_is_in_document {
+            self.doc.snapshot_node(node_id);
 
-        let node = &mut self.doc.nodes[node_id];
-        if let Some(mut data) = node.stylo_element_data.get_mut() {
-            data.hint |= RestyleHint::restyle_subtree();
-            data.damage.insert(ALL_DAMAGE);
-        }
-
-        // TODO: make this fine grained / conditional based on ElementSelectorFlags
-        let parent = node.parent;
-        if let Some(parent_id) = parent {
-            let parent = &mut self.doc.nodes[parent_id];
-            if let Some(mut data) = parent.stylo_element_data.get_mut() {
+            let node = &mut self.doc.nodes[node_id];
+            if let Some(mut data) = node.stylo_element_data.get_mut() {
                 data.hint |= RestyleHint::restyle_subtree();
+                data.damage.insert(ALL_DAMAGE);
             }
-        }
 
-        // Mark ancestors dirty so the style traversal visits this subtree.
-        // Without this, the traversal may skip nodes with pending RestyleHint/damage
-        // because it uses dirty_descendants flags to determine which subtrees to visit.
-        self.doc.nodes[node_id].mark_ancestors_dirty();
+            // TODO: make this fine grained / conditional based on ElementSelectorFlags
+            let parent = node.parent;
+            if let Some(parent_id) = parent {
+                let parent = &mut self.doc.nodes[parent_id];
+                if let Some(mut data) = parent.stylo_element_data.get_mut() {
+                    data.hint |= RestyleHint::restyle_subtree();
+                }
+            }
+
+            // Mark ancestors dirty so the style traversal visits this subtree.
+            // Without this, the traversal may skip nodes with pending RestyleHint/damage
+            // because it uses dirty_descendants flags to determine which subtrees to visit.
+            self.doc.nodes[node_id].mark_ancestors_dirty();
+        }
 
         let node = &mut self.doc.nodes[node_id];
 
         let NodeData::Element(ref mut element) = node.data else {
             return;
         };
+
+        // If element is a CustomWidget, then Ccall attribute_changed on it
+        #[cfg(feature = "custom-widget")]
+        if let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data {
+            let old_value = element.attrs.get(&name).as_ref().map(|attr| &*attr.value);
+            widget_data
+                .widget
+                .attribute_changed(&name.local, old_value, Some(value));
+        }
 
         element.attrs.set(name.clone(), value);
 
@@ -273,9 +286,33 @@ impl DocumentMutator<'_> {
             return;
         }
 
+        // FTS: `is_focussable` is computed once at element construction from
+        // the attrs present THEN. Toolkits that build elements empty and set
+        // attributes afterwards (dioxus-native-dom, and any incremental
+        // mutation path) would otherwise never make a `tabindex` element
+        // focussable. Re-flush when a focus-affecting attribute changes so
+        // click/tab/programmatic focus works on such elements. Computed from
+        // `name` (not the `element`-borrowed `attr`/`tag`) so it can run
+        // after the borrow ends.
+        let refresh_focussable = matches!(
+            name.local,
+            local_name!("tabindex") | local_name!("disabled")
+        );
+        // `autofocus` applied as a normal attribute mutation (dioxus builds
+        // the element then sets attrs — it never runs the HTML parser's
+        // node_to_autofocus path). Focus the node once it's in the document.
+        let do_autofocus = cfg!(feature = "autofocus")
+            && name.local == local_name!("autofocus")
+            && value != "false";
+
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
         if !node.flags.is_in_document() {
+            if refresh_focussable {
+                if let Some(el) = node.element_data_mut() {
+                    el.flush_is_focussable();
+                }
+            }
             return;
         }
 
@@ -288,21 +325,37 @@ impl DocumentMutator<'_> {
         } else if (tag, attr) == tag_and_attr!("link", "href") {
             self.load_linked_stylesheet(node_id);
         }
+
+        if refresh_focussable {
+            if let Some(el) = self.doc.nodes[node_id].element_data_mut() {
+                el.flush_is_focussable();
+            }
+        }
+        // Must run after flush_is_focussable (set_focus_to no-ops on a
+        // non-focussable node) and after the element borrow ends.
+        if do_autofocus {
+            self.doc.set_focus_to(node_id);
+        }
     }
 
     pub fn clear_attribute(&mut self, node_id: usize, name: QualName) {
-        self.doc.snapshot_node(node_id);
+        let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        if node_is_in_document {
+            self.doc.snapshot_node(node_id);
 
-        let node = &mut self.doc.nodes[node_id];
+            let node = &mut self.doc.nodes[node_id];
 
-        if let Some(mut data) = node.stylo_element_data.get_mut() {
-            data.hint |= RestyleHint::restyle_subtree();
-            data.damage.insert(ALL_DAMAGE);
+            if let Some(mut data) = node.stylo_element_data.get_mut() {
+                data.hint |= RestyleHint::restyle_subtree();
+                data.damage.insert(ALL_DAMAGE);
+            }
+
+            // Mark ancestors dirty so the style traversal visits this subtree.
+            // Without this, the traversal may skip nodes with pending RestyleHint/damage.
+            node.mark_ancestors_dirty();
         }
 
-        // Mark ancestors dirty so the style traversal visits this subtree.
-        // Without this, the traversal may skip nodes with pending RestyleHint/damage.
-        node.mark_ancestors_dirty();
+        let node = &mut self.doc.nodes[node_id];
 
         let Some(element) = node.element_data_mut() else {
             return;
@@ -312,6 +365,15 @@ impl DocumentMutator<'_> {
         let had_attr = removed_attr.is_some();
         if !had_attr {
             return;
+        }
+
+        // If element is a CustomWidget, then call attribute_changed on it
+        #[cfg(feature = "custom-widget")]
+        if let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data {
+            let old_value = removed_attr.as_ref().map(|attr| &*attr.value);
+            widget_data
+                .widget
+                .attribute_changed(&name.local, old_value, None);
         }
 
         if name.local == local_name!("id") {
@@ -361,6 +423,16 @@ impl DocumentMutator<'_> {
 
     pub fn remove_sub_document(&mut self, node_id: usize) {
         self.doc.remove_sub_document(node_id)
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn set_custom_widget(&mut self, node_id: usize, widget: Box<dyn crate::Widget>) {
+        self.doc.set_custom_widget(node_id, widget)
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn remove_custom_widget(&mut self, node_id: usize) {
+        self.doc.remove_custom_widget(node_id)
     }
 
     /// Remove the node from it's parent but don't drop it
@@ -460,6 +532,35 @@ impl DocumentMutator<'_> {
         child_ids: &[usize],
         insert_children_fn: &dyn Fn(&mut Node, &[usize]),
     ) {
+        // Detach the children from their old parents *before* inserting them into
+        // the new parent (matching DOM `insertBefore` semantics). If a child is
+        // being moved within the same parent then detaching it after insertion
+        // would remove both the old and the newly-inserted entries from the
+        // parent's child list, and anchor indices would be computed against a
+        // child list that still contains the moved nodes.
+        for child_id in child_ids.iter().copied() {
+            let child = &mut self.doc.nodes[child_id];
+            let child_was_in_doc = child.flags.is_in_document();
+            let Some(old_parent_id) = child.parent.take() else {
+                continue;
+            };
+
+            let old_parent = &mut self.doc.nodes[old_parent_id];
+            old_parent.insert_damage(ALL_DAMAGE);
+
+            // TODO: make this fine grained / conditional based on ElementSelectorFlags
+            if child_was_in_doc {
+                if let Some(mut data) = old_parent.stylo_element_data.get_mut() {
+                    data.hint |= RestyleHint::restyle_subtree();
+                }
+                // Mark ancestors dirty so the style traversal visits this subtree.
+                old_parent.mark_ancestors_dirty();
+            }
+
+            old_parent.children.retain(|id| *id != child_id);
+            self.maybe_record_node(old_parent_id);
+        }
+
         let new_parent = &mut self.doc.nodes[parent_id];
         new_parent.insert_damage(ALL_DAMAGE);
         let new_parent_is_in_doc = new_parent.flags.is_in_document();
@@ -477,28 +578,11 @@ impl DocumentMutator<'_> {
 
         for child_id in child_ids.iter().copied() {
             let child = &mut self.doc.nodes[child_id];
-            let old_parent_id = child.parent.replace(parent_id);
-
             let child_was_in_doc = child.flags.is_in_document();
+            child.parent = Some(parent_id);
+
             if new_parent_is_in_doc != child_was_in_doc {
                 self.process_added_subtree(child_id);
-            }
-
-            if let Some(old_parent_id) = old_parent_id {
-                let old_parent = &mut self.doc.nodes[old_parent_id];
-                old_parent.insert_damage(ALL_DAMAGE);
-
-                // TODO: make this fine grained / conditional based on ElementSelectorFlags
-                if child_was_in_doc {
-                    if let Some(mut data) = old_parent.stylo_element_data.get_mut() {
-                        data.hint |= RestyleHint::restyle_subtree();
-                    }
-                    // Mark ancestors dirty so the style traversal visits this subtree.
-                    old_parent.mark_ancestors_dirty();
-                }
-
-                old_parent.children.retain(|id| *id != child_id);
-                self.maybe_record_node(old_parent_id);
             }
         }
 
@@ -574,6 +658,8 @@ impl<'doc> DocumentMutator<'doc> {
                 SpecialOp::LoadCustomPaintSource(node_id) => self.load_custom_paint_src(node_id),
                 SpecialOp::ProcessButtonInput(node_id) => self.process_button_input(node_id),
                 SpecialOp::UnloadSubDocument(node_id) => self.remove_sub_document(node_id),
+                #[cfg(feature = "custom-widget")]
+                SpecialOp::UnloadCustomWidget(node_id) => self.remove_custom_widget(node_id),
             }
         }
 
@@ -633,6 +719,17 @@ impl<'doc> DocumentMutator<'doc> {
 
     fn process_removed_subtree(&mut self, node_id: usize) {
         self.doc.iter_subtree_mut(node_id, |node_id, doc| {
+            // FTS: a node added and removed within one mutation batch is still
+            // queued for `flush`. Once it is dropped its id is dead, and
+            // `flush` indexing it panics ("invalid key" in
+            // `reset_form_owner`) — seen at app start, when the first renders
+            // replace whole subtrees holding buttons/inputs. Forget it here.
+            self.form_nodes.remove(&node_id);
+            self.style_nodes.remove(&node_id);
+            if self.title_node == Some(node_id) {
+                self.title_node = None;
+            }
+
             let node = &mut doc.nodes[node_id];
             node.flags.set(NodeFlags::IS_IN_DOCUMENT, false);
 
@@ -647,6 +744,23 @@ impl<'doc> DocumentMutator<'doc> {
             // This prevents stale active_node_id references.
             if doc.active_node_id == Some(node_id) {
                 doc.active_node_id = None;
+            }
+
+            // FTS: a live text-selection endpoint can name a node from the
+            // subtree being removed (a drag-selection left in place across a
+            // big re-render — switching profiles frees a whole patch list at
+            // once). Left dangling, the next `get_text_selection_ranges()`
+            // call resolves it and indexes a freed slab entry, panicking
+            // with "invalid key" in `traversal::resolve_for_traversal` — the
+            // same class of bug as the hover/active clears above, just a
+            // different stale reference. For an anonymous-block endpoint,
+            // `node_or_parent` names the PARENT, so this also catches the
+            // case where the parent itself is what's being removed.
+            if doc.text_selection.anchor.node_or_parent == Some(node_id) {
+                doc.text_selection.anchor.clear();
+            }
+            if doc.text_selection.focus.node_or_parent == Some(node_id) {
+                doc.text_selection.focus.clear();
             }
 
             // Remove any snapshot for this node to prevent stale snapshot references
@@ -671,6 +785,11 @@ impl<'doc> DocumentMutator<'doc> {
                     self.eager_op_queue
                         .push(SpecialOp::UnloadSubDocument(node_id));
                 }
+                #[cfg(feature = "custom-widget")]
+                SpecialElementData::CustomWidget(_) => {
+                    self.eager_op_queue
+                        .push(SpecialOp::UnloadCustomWidget(node_id));
+                }
                 SpecialElementData::Stylesheet(_) => self
                     .eager_op_queue
                     .push(SpecialOp::UnloadStylesheet(node_id)),
@@ -681,7 +800,7 @@ impl<'doc> DocumentMutator<'doc> {
                 SpecialElementData::TableRoot(_) => {}
                 SpecialElementData::TextInput(_) => {}
                 SpecialElementData::CheckboxInput(_) => {}
-                #[cfg(feature = "file_input")]
+                #[cfg(feature = "file-input")]
                 SpecialElementData::FileInput(_) => {}
                 SpecialElementData::None => {}
             }
@@ -745,6 +864,7 @@ impl<'doc> DocumentMutator<'doc> {
                 source_url: url.clone(),
                 guard: self.doc.guard.clone(),
                 net_provider: self.doc.net_provider.clone(),
+                abort_signal: self.doc.abort_signal.clone(),
             },
         );
 
@@ -754,9 +874,11 @@ impl<'doc> DocumentMutator<'doc> {
                 .insert(handler.request_id());
         }
 
-        self.doc
-            .net_provider
-            .fetch(self.doc.id(), Request::get(url), Box::new(handler));
+        self.doc.net_provider.fetch(
+            self.doc.id(),
+            self.doc.build_request(url),
+            Box::new(handler),
+        );
     }
 
     fn unload_stylesheet(&mut self, node_id: usize) {
@@ -813,7 +935,7 @@ impl<'doc> DocumentMutator<'doc> {
 
                 self.doc.net_provider.fetch(
                     self.doc.id(),
-                    Request::get(src),
+                    self.doc.build_request(src),
                     ResourceHandler::boxed(
                         self.doc.tx.clone(),
                         self.doc.id(),
@@ -859,7 +981,7 @@ impl<'doc> DocumentMutator<'doc> {
             self.append_children(target_id, &[id]);
             return;
         }
-        #[cfg(feature = "file_input")]
+        #[cfg(feature = "file-input")]
         if let ("input", Some("file")) = (tagname, type_attr) {
             let button_id = self.create_element(
                 qual_name!("button", html),

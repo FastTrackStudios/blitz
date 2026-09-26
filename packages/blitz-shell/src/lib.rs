@@ -25,7 +25,7 @@ pub use crate::window::{View, WindowConfig};
 pub use crate::net::DataUriNetProvider;
 
 #[cfg(all(
-    feature = "file_dialog",
+    feature = "file-dialog",
     any(
         target_os = "windows",
         target_os = "macos",
@@ -86,10 +86,11 @@ pub fn current_android_app() -> android_activity::AndroidApp {
 
 pub struct BlitzShellProvider {
     window: Arc<dyn Window>,
+    proxy: BlitzShellProxy,
 }
 impl BlitzShellProvider {
-    pub fn new(window: Arc<dyn Window>) -> Self {
-        Self { window }
+    pub fn new(window: Arc<dyn Window>, proxy: BlitzShellProxy) -> Self {
+        Self { window, proxy }
     }
 }
 
@@ -97,8 +98,17 @@ impl ShellProvider for BlitzShellProvider {
     fn request_redraw(&self) {
         self.window.request_redraw();
     }
-    fn set_cursor(&self, icon: CursorIcon) {
-        self.window.set_cursor(Cursor::Icon(icon));
+    fn set_cursor(&self, icon: Option<CursorIcon>) {
+        match icon {
+            Some(icon) => {
+                self.window.set_cursor_visible(true);
+                self.window.set_cursor(Cursor::Icon(icon));
+            }
+            None => {
+                self.window.set_cursor(Cursor::Icon(CursorIcon::Default));
+                self.window.set_cursor_visible(false)
+            }
+        }
     }
     fn set_window_title(&self, title: String) {
         self.window.set_title(&title);
@@ -119,6 +129,27 @@ impl ShellProvider for BlitzShellProvider {
                 LogicalSize::new(width, height).into(),
             ),
         ));
+    }
+
+    fn request_window_close(&self) {
+        self.proxy.send_event(BlitzShellEvent::CloseWindow {
+            window_id: self.window.id(),
+        });
+    }
+    fn set_window_minimized(&self, minimized: bool) {
+        self.window.set_minimized(minimized);
+    }
+    fn set_window_maximized(&self, maximized: bool) {
+        self.window.set_maximized(maximized);
+    }
+    fn is_window_maximized(&self) -> bool {
+        self.window.is_maximized()
+    }
+    fn set_window_decorations(&self, decorations: bool) {
+        self.window.set_decorations(decorations);
+    }
+    fn drag_window(&self) {
+        let _ = self.window.drag_window();
     }
 
     #[cfg(all(
@@ -158,7 +189,7 @@ impl ShellProvider for BlitzShellProvider {
     }
 
     #[cfg(all(
-        feature = "file_dialog",
+        feature = "file-dialog",
         any(
             target_os = "windows",
             target_os = "macos",

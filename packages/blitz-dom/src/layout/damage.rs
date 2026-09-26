@@ -1,16 +1,15 @@
 use std::ops::Range;
 
+use crate::Node;
 use crate::net::ResourceHandler;
 use crate::node::NodeFlags;
 use crate::{
-    BaseDocument, net::ImageHandler, node::BackgroundImageData, node::Status, util::ImageType,
+    BaseDocument, net::ImageHandler, node::ImageResourceData, node::Status, util::ImageLayerKind,
 };
-use crate::{NON_INCREMENTAL, Node};
-use blitz_traits::net::Request;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::selector_parser::RestyleDamage;
-use style::servo::url::ComputedUrl;
+use style::url::ComputedUrl;
 use style::values::computed::Float;
 use style::values::generics::image::Image as StyloImage;
 use style::values::specified::align::AlignFlags;
@@ -32,7 +31,6 @@ pub(crate) const ALL_DAMAGE: RestyleDamage =
     RestyleDamage::from_bits_retain(0b_0000_0000_0111_1111);
 
 impl BaseDocument {
-    #[cfg(feature = "incremental")]
     pub(crate) fn propagate_damage_flags(
         &mut self,
         node_id: usize,
@@ -44,6 +42,12 @@ impl BaseDocument {
             return RestyleDamage::empty();
         };
         damage |= damage_from_parent;
+
+        // Flush updated pseudo-element styles to their anonymous nodes so that
+        // style changes which don't trigger box construction still take effect.
+        //
+        // TODO: see if this can be made more efficient (/run less often)
+        self.sync_pseudo_element_styles(node_id);
 
         let damage_for_children = RestyleDamage::empty();
         let children = std::mem::take(&mut self.nodes[node_id].children);
@@ -115,6 +119,61 @@ impl BaseDocument {
 
         // Propagate damage to parent
         damage_for_parent
+    }
+
+    /// Flush updated pseudo-element (`::before`/`::after`) styles from the owning
+    /// element's stylo data to the pseudo-element's anonymous node.
+    ///
+    /// Pseudo-element styles are normally flushed to the pseudo-element's node
+    /// during box construction (see `flush_pseudo_elements`), but in incremental
+    /// mode box construction only runs for nodes with construction damage.
+    /// Pseudo-element style changes which don't require reconstruction (e.g.
+    /// animations/transitions of repaint- or relayout-only properties) must still
+    /// be flushed to the pseudo-element's node - along with the damage they imply -
+    /// so that layout and paint see the new style.
+    fn sync_pseudo_element_styles(&mut self, node_id: usize) {
+        let node = &self.nodes[node_id];
+
+        let before_node_id = node.before;
+        let after_node_id = node.after;
+        if before_node_id.is_none() && after_node_id.is_none() {
+            return;
+        }
+
+        let (before_style, after_style) = {
+            let style_data = node.stylo_element_data.get();
+            let Some(style_data) = style_data.as_ref() else {
+                return;
+            };
+            // Note: yes these are kinda backwards (see `flush_pseudo_elements`)
+            let pseudos = style_data.styles.pseudos.as_array();
+            (pseudos[1].clone(), pseudos[0].clone())
+        };
+
+        // Creation and removal of pseudo-elements is handled during box construction
+        // (Stylo generates construction damage for those cases), so only the case
+        // where the pseudo-element both was and remains present is handled here.
+        for (pe_node_id, pe_style) in [(before_node_id, before_style), (after_node_id, after_style)]
+        {
+            let (Some(pe_node_id), Some(pe_style)) = (pe_node_id, pe_style) else {
+                continue;
+            };
+            let mut pe_data = self.nodes[pe_node_id].stylo_element_data.get_mut();
+            let Some(pe_data) = pe_data.as_mut() else {
+                continue;
+            };
+            let Some(old_style) = pe_data.styles.primary.clone() else {
+                continue;
+            };
+            if std::ptr::eq(&*old_style, &*pe_style) {
+                continue;
+            }
+
+            let diff = RestyleDamage::compute_style_difference::<&Node>(&old_style, &pe_style);
+            pe_data.damage.insert(diff.damage);
+            pe_data.styles.primary = Some(pe_style);
+            pe_data.set_restyled();
+        }
     }
 }
 
@@ -371,20 +430,127 @@ impl BaseDocument {
         self.flush_styles_to_layout_impl(node_id, None);
     }
 
+    /// Flush a CSS image layer list (`background-image` or `mask-image`) from style
+    /// to dedicated storage on the node, fetching any images which are not yet loaded.
+    fn flush_image_layers_from_style(&mut self, node_id: usize, kind: ImageLayerKind) {
+        let doc_id = self.id();
+        let node = self.nodes.get_mut(node_id).unwrap();
+        let stylo_element_data = node.stylo_element_data.get();
+        let primary_styles = stylo_element_data
+            .as_ref()
+            .and_then(|data| data.styles.get_primary());
+        let Some(style) = primary_styles else {
+            return;
+        };
+        let Some(elem) = node.data.downcast_element_mut() else {
+            return;
+        };
+
+        let (style_images, elem_images) = match kind {
+            ImageLayerKind::Background => (
+                &style.get_background().background_image.0,
+                &mut elem.background_images,
+            ),
+            ImageLayerKind::Mask => (&style.get_svg().mask_image.0, &mut elem.mask_images),
+        };
+
+        let len = style_images.len();
+        elem_images.resize_with(len, || None);
+
+        for idx in 0..len {
+            let style_image = &style_images[idx];
+            let new_image = match style_image {
+                StyloImage::Url(ComputedUrl::Valid(new_url)) => {
+                    let old_image = elem_images[idx].as_ref();
+                    let old_image_url = old_image.map(|data| &data.url);
+                    if old_image_url.is_some_and(|old_url| **new_url == **old_url) {
+                        break;
+                    }
+
+                    // Check cache first
+                    let url_str = new_url.as_str();
+                    if let Some(cached_image) = self.image_cache.get(url_str) {
+                        #[cfg(feature = "tracing")]
+                        tracing::info!("Loading image {url_str} from cache");
+                        Some(ImageResourceData {
+                            url: new_url.clone(),
+                            status: Status::Ok,
+                            image: cached_image.clone(),
+                        })
+                    } else if let Some(waiting_list) = self.pending_images.get_mut(url_str) {
+                        // Image is already being fetched, queue this node
+                        #[cfg(feature = "tracing")]
+                        tracing::info!("Image {url_str} already pending, queueing node {node_id}");
+                        waiting_list.push((node_id, kind.image_type(idx)));
+                        Some(ImageResourceData::new(new_url.clone()))
+                    } else {
+                        // Start fetch and track as pending
+                        #[cfg(feature = "tracing")]
+                        tracing::info!("Fetching image {url_str}");
+                        self.pending_images
+                            .insert(url_str.to_string(), vec![(node_id, kind.image_type(idx))]);
+
+                        self.net_provider.fetch(
+                            doc_id,
+                            crate::net::stamped_request(
+                                (**new_url).clone(),
+                                self.abort_signal.as_ref(),
+                            ),
+                            ResourceHandler::boxed(
+                                self.tx.clone(),
+                                doc_id,
+                                None, // Don't pass node_id, we'll handle via pending_images
+                                self.shell_provider.clone(),
+                                ImageHandler::new(kind.image_type(idx)),
+                            ),
+                        );
+
+                        Some(ImageResourceData::new(new_url.clone()))
+                    }
+                }
+                _ => None,
+            };
+
+            // Element will always exist due to resize_with above
+            elem_images[idx] = new_image;
+        }
+    }
+
     /// Walk the whole tree, converting styles to layout
     fn flush_styles_to_layout_impl(
         &mut self,
         node_id: usize,
         parent_stacking_context: Option<&mut HoistedPaintChildren>,
     ) {
-        let doc_id = self.id();
+        let incremental = self.incremental_layout;
+
+        // Whether this node's own style is worth converting again.
+        //
+        // The walk still visits everything, because the ordering work
+        // below depends on children this node cannot see the damage of.
+        // What it skips is the expensive part: a full Taffy style
+        // conversion and two image-layer scans, for a node whose style
+        // has not moved. On an arrangement of ten thousand nodes with
+        // one changed transform that was the largest phase in the
+        // frame — 2.5ms of re-deriving styles that were already right.
+        let restyled = !incremental
+            || self
+                .nodes
+                .get(node_id)
+                .and_then(|node| node.damage())
+                .is_none_or(|damage| !damage.is_empty());
 
         let mut new_stacking_context: HoistedPaintChildren = HoistedPaintChildren::new();
         let stacking_context = &mut new_stacking_context;
 
+        if restyled {
+            // Flush background/mask images from style to dedicated storage on the node
+            self.flush_image_layers_from_style(node_id, ImageLayerKind::Background);
+            self.flush_image_layers_from_style(node_id, ImageLayerKind::Mask);
+        }
+
         let display = {
             let node = self.nodes.get_mut(node_id).unwrap();
-            let _damage = node.damage().unwrap_or(ALL_DAMAGE);
             let stylo_element_data = node.stylo_element_data.get();
             let primary_styles = stylo_element_data
                 .as_ref()
@@ -394,84 +560,22 @@ impl BaseDocument {
                 return;
             };
 
-            // if damage.intersects(RestyleDamage::RELAYOUT | CONSTRUCT_BOX) {
-            node.style = stylo_taffy::to_taffy_style(style);
-            node.display_constructed_as = style.clone_display();
-            // }
-
-            // Flush background image from style to dedicated storage on the node
-            // TODO: handle multiple background images
-            if let Some(elem) = node.data.downcast_element_mut() {
-                let style_bgs = &style.get_background().background_image.0;
-                let elem_bgs = &mut elem.background_images;
-
-                let len = style_bgs.len();
-                elem_bgs.resize_with(len, || None);
-
-                for idx in 0..len {
-                    let background_image = &style_bgs[idx];
-                    let new_bg_image = match background_image {
-                        StyloImage::Url(ComputedUrl::Valid(new_url)) => {
-                            let old_bg_image = elem_bgs[idx].as_ref();
-                            let old_bg_image_url = old_bg_image.map(|data| &data.url);
-                            if old_bg_image_url.is_some_and(|old_url| **new_url == **old_url) {
-                                break;
-                            }
-
-                            // Check cache first
-                            let url_str = new_url.as_str();
-                            if let Some(cached_image) = self.image_cache.get(url_str) {
-                                #[cfg(feature = "tracing")]
-                                tracing::info!("Loading image {url_str} from cache");
-                                Some(BackgroundImageData {
-                                    url: new_url.clone(),
-                                    status: Status::Ok,
-                                    image: cached_image.clone(),
-                                })
-                            } else if let Some(waiting_list) = self.pending_images.get_mut(url_str)
-                            {
-                                // Image is already being fetched, queue this node
-                                #[cfg(feature = "tracing")]
-                                tracing::info!(
-                                    "Image {url_str} already pending, queueing node {node_id}"
-                                );
-                                waiting_list.push((node_id, ImageType::Background(idx)));
-                                Some(BackgroundImageData::new(new_url.clone()))
-                            } else {
-                                // Start fetch and track as pending
-                                #[cfg(feature = "tracing")]
-                                tracing::info!("Fetching image {url_str}");
-                                self.pending_images.insert(
-                                    url_str.to_string(),
-                                    vec![(node_id, ImageType::Background(idx))],
-                                );
-
-                                self.net_provider.fetch(
-                                    doc_id,
-                                    Request::get((**new_url).clone()),
-                                    ResourceHandler::boxed(
-                                        self.tx.clone(),
-                                        doc_id,
-                                        None, // Don't pass node_id, we'll handle via pending_images
-                                        self.shell_provider.clone(),
-                                        ImageHandler::new(ImageType::Background(idx)),
-                                    ),
-                                );
-
-                                Some(BackgroundImageData::new(new_url.clone()))
-                            }
-                        }
-                        _ => None,
-                    };
-
-                    // Element will always exist due to resize_with above
-                    elem_bgs[idx] = new_bg_image;
-                }
+            // FTS: also re-convert when the computed values were *replaced*,
+            // damage or not. `node.style` holds raw pointers into them (every
+            // `calc()` length), and a damage-free restyle still frees the old
+            // ones — skipping here left Taffy dereferencing freed memory
+            // (SIGSEGV in `CalcNode::resolve_internal` when a surface swapped
+            // a batch of Tailwind `calc(var(--spacing) * n)` classes).
+            let source = &**style as *const _ as usize;
+            if restyled || node.style_source != source {
+                node.style = stylo_taffy::to_taffy_style(style);
+                node.display_constructed_as = style.clone_display();
+                node.style_source = source;
             }
 
             // In non-incremental mode we unconditionally clear the Taffy cache.
             // In incremental mode this is handled as part of damage propagation.
-            if NON_INCREMENTAL {
+            if !incremental {
                 node.cache.clear();
                 if let Some(inline_layout) = node
                     .data
@@ -532,7 +636,9 @@ impl BaseDocument {
                 let z_index = style.clone_z_index().integer_or(0);
 
                 // TODO: more complete hoisting detection
-                if position != Position::Static && z_index != 0 {
+                // z-index applies to static flex/grid items too
+                // (css-flexbox-1 §painting, css-grid-1 §z-order).
+                if z_index != 0 && (position != Position::Static || is_flex_or_grid) {
                     stacking_context.children.push(HoistedPaintChild {
                         node_id: child_id,
                         z_index,
@@ -576,8 +682,11 @@ impl BaseDocument {
 #[inline(always)]
 fn position_to_order(pos: Position) -> i32 {
     match pos {
-        Position::Static | Position::Relative | Position::Sticky => 0,
-        Position::Absolute | Position::Fixed => 2,
+        Position::Static => 0,
+        // All positioned descendants with z-index: auto share one paint
+        // level (CSS 2.1 Appendix E step 8); the stable sort keeps them in
+        // tree order among themselves, above in-flow content and floats.
+        Position::Relative | Position::Sticky | Position::Absolute | Position::Fixed => 2,
     }
 }
 #[inline(always)]
@@ -588,17 +697,28 @@ fn float_to_order(pos: Float) -> i32 {
     }
 }
 
+/// Paint sort key: (paint level, order-modified position). Positioned
+/// (z-index: auto) descendants paint above in-flow content (CSS 2.1
+/// Appendix E step 8); within a level the stable sort preserves
+/// (order-modified) document order.
 #[inline(always)]
-fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> i32 {
+fn node_to_paint_order(node: &Node, is_flex_or_grid: bool) -> (i32, i32) {
     let Some(style) = node.primary_styles() else {
-        return 0;
+        return (0, 0);
     };
+    let position = style.clone_position();
     if is_flex_or_grid {
-        match style.clone_position() {
-            Position::Static | Position::Relative | Position::Sticky => style.clone_order(),
-            Position::Absolute | Position::Fixed => 0,
+        match position {
+            Position::Static => (0, style.clone_order()),
+            Position::Relative | Position::Sticky => (2, style.clone_order()),
+            // Out-of-flow children are not flex/grid items: `order` does
+            // not apply; tree order does.
+            Position::Absolute | Position::Fixed => (2, 0),
         }
     } else {
-        position_to_order(style.clone_position()) + float_to_order(style.clone_float())
+        (
+            position_to_order(position) + float_to_order(style.clone_float()),
+            0,
+        )
     }
 }

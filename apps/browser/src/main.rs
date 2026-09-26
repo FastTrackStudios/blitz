@@ -11,7 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 
 use blitz_traits::net::Url;
-use dioxus_native::{NodeHandle, WindowAttributes, prelude::*};
+use dioxus_native::{NodeHandle, WindowAttributes, prelude::*, use_back_button};
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesMacOS;
@@ -19,10 +19,11 @@ use winit::platform::macos::WindowAttributesMacOS;
 pub(crate) type StdNetProvider = blitz_net::Provider;
 
 mod about_pages;
+mod browser_history;
 #[cfg(any(feature = "screenshot", feature = "capture"))]
 mod capture;
 mod document_loader;
-#[cfg(feature = "vello")]
+mod favicon;
 mod fps_overlay;
 mod history;
 mod icons;
@@ -31,12 +32,17 @@ mod status_bar;
 mod tab;
 mod tab_strip;
 mod toolbar;
+mod url_suggestions;
 
 use about_pages::AboutPage;
+use browser_history::{BrowsingHistory, HistoryService, HistoryStore, MAX_HISTORY_ENTRIES};
 use status_bar::StatusBar;
-use tab::{Tab, TabId, TabStoreImplExt, TabWebView, active_tab, open_tab, tab_title_or_url};
+use tab::{Tab, TabId, TabStoreImplExt, TabWebView, active_tab, open_tab, tab_display_title};
 use tab_strip::TabStrip;
 use toolbar::Toolbar;
+use url_suggestions::provide_url_suggester;
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WinIcon;
 
 static BROWSER_UI_STYLES: Asset = asset!("../assets/browser.css");
 pub(crate) const IS_MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
@@ -48,10 +54,31 @@ pub fn android_main(android_app: dioxus_native::AndroidApp) {
     main()
 }
 
+#[derive(Clone)]
+pub(crate) struct CliInitialUrl(pub Option<Url>);
+
+fn parse_cli_url(s: &str) -> Option<Url> {
+    if let Ok(url) = Url::parse(s) {
+        return Some(url);
+    }
+    if s.contains('.') && !s.contains(' ') {
+        if let Ok(url) = Url::parse(&format!("https://{s}")) {
+            return Some(url);
+        }
+    }
+    None
+}
+
 fn main() {
     #[cfg(feature = "tracing")]
     tracing_subscriber::fmt::init();
+
+    let cli_url = std::env::args().skip(1).find_map(|a| parse_cli_url(&a));
+
     let window_attributes = WindowAttributes::default();
+    #[cfg(target_os = "windows")]
+    let window_attributes = window_attributes
+        .with_window_icon(WinIcon::from_resource(32512, None).map(Into::into).ok());
     #[cfg(target_os = "macos")]
     let window_attributes = window_attributes.with_platform_attributes(Box::new(
         WindowAttributesMacOS::default()
@@ -61,19 +88,44 @@ fn main() {
             .with_unified_titlebar(true),
     ));
 
-    dioxus_native::launch_cfg(app, Vec::new(), vec![Box::new(window_attributes)])
+    let initial_url_ctx = CliInitialUrl(cli_url);
+    let contexts: Vec<Box<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>> =
+        vec![Box::new(move || {
+            Box::new(initial_url_ctx.clone()) as Box<dyn std::any::Any>
+        })];
+
+    dioxus_native::launch_cfg(app, contexts, vec![Box::new(window_attributes)])
 }
 
 fn app() -> Element {
     let home_url = use_hook(|| AboutPage::NewTab.parsed_url());
+    let cli_initial_url = use_hook(|| try_consume_context::<CliInitialUrl>().and_then(|c| c.0));
     let net_provider = use_context::<Arc<StdNetProvider>>();
 
     let url_input_handle: Signal<Option<NodeHandle>> = use_signal(|| None);
     let url_input_value = use_signal(|| home_url.to_string());
 
+    let history_store: HistoryStore = use_hook(HistoryStore::open);
+
+    // Synchronous on purpose: the toolbar's URL suggestions read from this
+    // store on first render, so the entries need to be present before the
+    // tree mounts. The read is a single sqlite query capped at
+    // MAX_HISTORY_ENTRIES rows and runs once per process.
+    let browsing_history: Store<BrowsingHistory> = {
+        let history_store = history_store.clone();
+        use_store(move || {
+            BrowsingHistory::from_entries(history_store.load_recent(MAX_HISTORY_ENTRIES))
+        })
+    };
+
+    let history_service = HistoryService::new(browsing_history, history_store);
+    use_context_provider(|| history_service.clone());
+    provide_url_suggester(browsing_history);
+
     let tabs: Store<Vec<Tab>> = use_store(Vec::new);
     let mut active_tab_id: Signal<TabId> = use_hook(|| {
-        let tab = open_tab(tabs, home_url.clone(), net_provider.clone());
+        let first_tab_url = cli_initial_url.clone().unwrap_or_else(|| home_url.clone());
+        let tab = open_tab(tabs, first_tab_url, net_provider.clone());
         Signal::new(tab.tab_id())
     });
 
@@ -83,6 +135,13 @@ fn app() -> Element {
         if let Some(handle) = url_input_handle() {
             drop(handle.set_focus(true));
         }
+    });
+
+    // Navigate back in the active tab's history when the (Android) hardware
+    // back button is pressed. `go_back` is a no-op when there is no history to
+    // go back to.
+    use_back_button(move || {
+        active_tab(tabs, active_tab_id()).go_back();
     });
 
     // HACK: Winit doesn't support "safe area" on Android yet.
@@ -100,14 +159,11 @@ fn app() -> Element {
 
     let show_fps: Signal<bool> = use_signal(|| false);
 
-    #[cfg(feature = "vello")]
     let fps_overlay_el = rsx!(if show_fps() {
         fps_overlay::FpsOverlay {}
     });
-    #[cfg(not(feature = "vello"))]
-    let fps_overlay_el = rsx!();
 
-    let window_title = tab_title_or_url(active_tab(tabs, active_tab_id()));
+    let window_title = tab_display_title(active_tab(tabs, active_tab_id()));
 
     rsx!(
         div {
@@ -120,7 +176,7 @@ fn app() -> Element {
             TabStrip {
                 tabs,
                 active_tab_id,
-                home_url: home_url.clone(),
+                home_url,
                 open_new_tab,
             }
             Toolbar {
@@ -128,6 +184,7 @@ fn app() -> Element {
                 url_input_value,
                 tabs,
                 active_tab_id,
+                open_new_tab,
                 show_fps,
             }
             for tab in tabs.iter() {
