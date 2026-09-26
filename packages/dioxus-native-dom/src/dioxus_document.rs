@@ -263,6 +263,8 @@ impl EventHandler for DioxusEventHandler<'_> {
         doc: &mut dyn Document,
         event_state: &mut EventState,
     ) {
+        set_event_converter(Box::new(NativeConverter {}));
+
         // As an optimisation we maintain a count of the total number event handlers of a given type
         // If this count is zero then we can skip handling that kind of event entirely.
         let event_kind_idx = event.data.discriminant() as usize;
