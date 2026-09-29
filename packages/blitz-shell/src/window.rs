@@ -35,9 +35,23 @@ use crate::accessibility::AccessibilityState;
 fn get_safe_area_insets(_window: &dyn Window) -> PhysicalInsets<u32> {
     Default::default()
 }
+/// The insets the page is laid out inside: the safe area, or — with
+/// `BLITZ_SAFE_AREA_SIDES=0` — only its top and bottom, the page drawn to
+/// the left and right edges and minding the sides itself (a phone on its
+/// side reports the camera housing's width on both sides, though only one
+/// side has it, and only mid-height).
 #[cfg(not(target_os = "macos"))]
 fn get_safe_area_insets(window: &dyn Window) -> PhysicalInsets<u32> {
-    window.safe_area()
+    static SIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let sides = *SIDES.get_or_init(|| {
+        std::env::var("BLITZ_SAFE_AREA_SIDES").map_or(true, |v| v != "0")
+    });
+    let mut insets = window.safe_area();
+    if !sides {
+        insets.left = 0;
+        insets.right = 0;
+    }
+    insets
 }
 
 pub struct WindowConfig<Rend: WindowRenderer> {
