@@ -97,6 +97,12 @@ pub struct View<Rend: WindowRenderer> {
     pub animation_timer: Option<Instant>,
     pub is_visible: bool,
     pub safe_area_insets: PhysicalInsets<u32>,
+    /// Frames left to re-read the safe area after a resize: on iOS a
+    /// rotation resizes the surface before UIKit updates the insets, so
+    /// the insets read at the resize are the old orientation's (a phone on
+    /// its side kept its upright top and bottom bands). A few frames after
+    /// it, the new ones have landed.
+    inset_checks: u32,
 
     #[cfg(target_arch = "wasm32")]
     pending_resize: Option<winit::dpi::PhysicalSize<u32>>,
@@ -208,6 +214,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             buttons: MouseEventButtons::None,
             active_events: Arc::new(AtomicRefCell::new(Vec::new())),
             safe_area_insets,
+            inset_checks: 0,
             #[cfg(target_arch = "wasm32")]
             pending_resize: None,
             #[cfg(target_arch = "wasm32")]
@@ -388,6 +395,25 @@ impl<Rend: WindowRenderer> View<Rend> {
             self.window.request_redraw();
             #[cfg(target_os = "ios")]
             self.ios_request_redraw.set(true);
+        }
+    }
+
+    /// Read the safe area again, and when it has changed since the last
+    /// resize, lay the page out in the new one: every frame (it is a
+    /// field read), and for a few frames after a resize, asking for them.
+    fn recheck_safe_area(&mut self) {
+        let now = get_safe_area_insets(&*self.window);
+        if now != self.safe_area_insets {
+            self.safe_area_insets = now;
+            let size = self.window.surface_size();
+            let width = size.width.saturating_sub(now.left + now.right);
+            let height = size.height.saturating_sub(now.top + now.bottom);
+            self.with_viewport(|v| v.window_size = (width, height));
+            self.request_redraw();
+        }
+        if self.inset_checks > 0 {
+            self.inset_checks -= 1;
+            self.request_redraw();
         }
     }
 
@@ -630,6 +656,7 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Currently handled at the level above in application.rs
             }
             WindowEvent::RedrawRequested => {
+                self.recheck_safe_area();
                 self.redraw();
             }
             WindowEvent::Moved(_) => {}
@@ -641,6 +668,9 @@ impl<Rend: WindowRenderer> View<Rend> {
             },
             WindowEvent::SurfaceResized(physical_size) => {
                 self.safe_area_insets = get_safe_area_insets(&*self.window);
+                // Half a second of frames to catch the insets UIKit sets
+                // after the resize (see `inset_checks`).
+                self.inset_checks = 30;
                 // On WASM, defer the apply: wgpu's surface.configure clears the canvas,
                 // so running it every frame flickers during a drag. The browser stretches
                 // the stale backing store until the debounce timer settles.
