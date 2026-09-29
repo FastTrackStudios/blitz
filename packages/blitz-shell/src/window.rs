@@ -833,13 +833,23 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Touch input doesn't emit a `PointerMoved` before the button
                 // event the way a mouse does, so synthesise a move to update the
                 // hover/hit position to the touch location.
+                //
+                // On a press, the move is the finger arriving, not dragging:
+                // it carries no held button. With the button already held,
+                // the document measured it from the *previous* press's
+                // position, took any tap somewhere new for a pan, and sent
+                // no click on release — every other tap was lost.
                 if id != BlitzPointerId::Mouse {
+                    let buttons = match state {
+                        ElementState::Pressed => self.buttons ^ button.into(),
+                        ElementState::Released => self.buttons,
+                    };
                     let event = BlitzPointerEvent {
                         id,
                         is_primary: primary,
                         coords,
                         button: Default::default(),
-                        buttons: self.buttons,
+                        buttons,
                         mods: winit_modifiers_to_kbt_modifiers(self.keyboard_modifiers.state()),
                         details: PointerDetails::default(),
                         element: Default::default(),
