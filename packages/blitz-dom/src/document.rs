@@ -2209,12 +2209,19 @@ impl BaseDocument {
     }
 
     pub fn is_animating(&self) -> bool {
+        // FTS: a custom widget animates when it says so, not for being
+        // there. Upstream counted any mounted widget as animating, and a
+        // window with one drew every frame forever — an idle phone at
+        // 100% of a core — while the widgets' own `needs_redraw` went
+        // unasked except after input.
+        // (Upstream since asks `requires_redraw`, #566; FTS widgets answer
+        // `needs_redraw`, so either keeps the frames coming.)
         #[cfg(feature = "custom-widget")]
         let custom_widget_is_animating = self.custom_widget_nodes.iter().any(|&node_id| {
             self.nodes[node_id]
                 .element_data()
                 .and_then(|el| el.custom_widget_data())
-                .is_some_and(|data| data.widget.requires_redraw())
+                .is_some_and(|data| data.widget.requires_redraw() || data.widget.needs_redraw())
         });
         #[cfg(not(feature = "custom-widget"))]
         let custom_widget_is_animating = false;

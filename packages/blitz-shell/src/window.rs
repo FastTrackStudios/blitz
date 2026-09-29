@@ -456,7 +456,6 @@ impl<Rend: WindowRenderer> View<Rend> {
 
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
-        let is_animating = inner.is_animating();
         let is_blocked = inner.has_pending_critical_resources();
         let insets = self.safe_area_insets;
 
@@ -494,6 +493,10 @@ impl<Rend: WindowRenderer> View<Rend> {
             );
         }
 
+        // FTS: asked after painting, not before. A widget's paint clears
+        // its own "changed" and sets it again when it goes on moving (a
+        // fling, a playhead): asked before, the answer is the last frame's.
+        let is_animating = inner.is_animating();
         drop(inner);
 
         blitz_traits::LAST_FRAME_MICROS.store(
