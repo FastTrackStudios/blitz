@@ -214,18 +214,31 @@ impl DocumentMutator<'_> {
     }
 
     pub fn set_attribute(&mut self, node_id: usize, name: QualName, value: &str) {
+        // Setting an attribute to the value it already has changes nothing:
+        // no restyle, no damage, no relayout from the root.
+        if let NodeData::Element(el) = &self.doc.nodes[node_id].data
+            && el.attrs.has_value(&name, value)
+        {
+            return;
+        }
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_node(node_id);
 
             let node = &mut self.doc.nodes[node_id];
+            // FTS: a `style` attribute restyles this element, and the style
+            // comparison decides the damage (a colour repaints; a width
+            // relays out) — not blanket damage on it and its parent.
+            let style_only = name.local == local_name!("style");
             if let Some(mut data) = node.stylo_element_data.get_mut() {
                 data.hint |= RestyleHint::restyle_subtree();
-                data.damage.insert(ALL_DAMAGE);
+                if !style_only {
+                    data.damage.insert(ALL_DAMAGE);
+                }
             }
 
             // TODO: make this fine grained / conditional based on ElementSelectorFlags
-            let parent = node.parent;
+            let parent = if style_only { None } else { node.parent };
             if let Some(parent_id) = parent {
                 let parent = &mut self.doc.nodes[parent_id];
                 if let Some(mut data) = parent.stylo_element_data.get_mut() {

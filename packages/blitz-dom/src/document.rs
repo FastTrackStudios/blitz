@@ -1652,15 +1652,14 @@ impl BaseDocument {
     }
 
     pub fn is_animating(&self) -> bool {
-        #[cfg(feature = "custom-widget")]
-        let has_custom_widgets = !self.custom_widget_nodes.is_empty();
-        #[cfg(not(feature = "custom-widget"))]
-        let has_custom_widgets = false;
-
+        // FTS: a custom widget does not keep the window animating. A
+        // widget with something new to draw asks for it (its component
+        // schedules an update, which redraws); one standing still costs
+        // nothing, where before every mounted widget redrew the whole
+        // window at vsync.
         self.has_canvas
             | self.has_active_animations
             | self.subdoc_is_animating
-            | has_custom_widgets
             | (self.scroll_animation != ScrollAnimationState::None)
             | self.scrollbars_animating()
     }

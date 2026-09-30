@@ -20,6 +20,7 @@ use atomic_refcell::AtomicRefCell;
 use std::any::Any;
 use std::sync::Arc;
 use std::task::Waker;
+use std::time::Duration;
 use web_time::Instant;
 use winit::event::{ButtonSource, ElementState, MouseButton};
 use winit::event_loop::ActiveEventLoop;
@@ -95,6 +96,8 @@ pub struct View<Rend: WindowRenderer> {
     /// avoid a reference cycle.
     pub active_events: Arc<AtomicRefCell<Vec<BlitzPointerEvent>>>,
     pub animation_timer: Option<Instant>,
+    /// FTS: redraw pacing for document updates (see `request_paced_redraw`).
+    pacing: Pacing,
     pub is_visible: bool,
     pub safe_area_insets: PhysicalInsets<u32>,
 
@@ -209,6 +212,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             #[cfg(target_arch = "wasm32")]
             resize_timer_scheduled: false,
             pointer_pos: Default::default(),
+            pacing: Pacing::from_env(),
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
             accessibility,
@@ -355,12 +359,49 @@ impl<Rend: WindowRenderer> View<Rend> {
                     }
                 }
 
-                self.request_redraw();
+                self.request_paced_redraw();
                 return true;
             }
         }
 
         false
+    }
+
+    /// A redraw for a document update, paced to `FTS_MAX_FPS` (30 unless
+    /// set; 0 = unpaced). Clocks that each update the document at their own
+    /// rate (meters, visualisers, lamps) would otherwise interleave into a
+    /// redraw at every vsync, each one painting the whole window. Input
+    /// still redraws at once: it asks the window directly.
+    fn request_paced_redraw(&mut self) {
+        let Some(min) = self.pacing.min_frame else {
+            self.request_redraw();
+            return;
+        };
+        let since = self.pacing.last_frame.elapsed();
+        if since >= min {
+            self.request_redraw();
+            return;
+        }
+        if self.pacing.pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let wait = min - since;
+        let doc_id = self.doc.id();
+        let tx = self.pacing.timer.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<(Duration, usize)>();
+            let proxy = self.proxy.clone();
+            std::thread::Builder::new()
+                .name("blitz-redraw-pacer".into())
+                .spawn(move || {
+                    while let Ok((wait, doc_id)) = rx.recv() {
+                        std::thread::sleep(wait);
+                        proxy.send_event(BlitzShellEvent::RequestRedraw { doc_id });
+                    }
+                })
+                .expect("spawn redraw pacer");
+            tx
+        });
+        let _ = tx.send((wait, doc_id));
     }
 
     pub fn request_redraw(&self) {
@@ -373,6 +414,10 @@ impl<Rend: WindowRenderer> View<Rend> {
 
     pub fn redraw(&mut self) {
         let frame_started = std::time::Instant::now();
+        self.pacing.last_frame = frame_started;
+        self.pacing
+            .pending
+            .store(false, std::sync::atomic::Ordering::Release);
         #[cfg(target_os = "ios")]
         self.ios_request_redraw.set(false);
         let animation_time = self.current_animation_time();
@@ -859,6 +904,32 @@ impl<Rend: WindowRenderer> View<Rend> {
             WindowEvent::DragMoved { .. } => {},
             WindowEvent::DragDropped { .. } => {},
             WindowEvent::DragLeft { .. } => {},
+        }
+    }
+}
+
+/// FTS: when the window last drew, and the one deferred redraw queued for
+/// a document update that came too soon after it.
+struct Pacing {
+    min_frame: Option<Duration>,
+    last_frame: Instant,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    timer: Option<std::sync::mpsc::Sender<(Duration, usize)>>,
+}
+
+impl Pacing {
+    fn from_env() -> Self {
+        let fps = std::env::var("FTS_MAX_FPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(30);
+        // No threads to pace with in a browser; it paces itself.
+        let fps = if cfg!(target_arch = "wasm32") { 0 } else { fps };
+        Self {
+            min_frame: (fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(fps))),
+            last_frame: Instant::now(),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timer: None,
         }
     }
 }

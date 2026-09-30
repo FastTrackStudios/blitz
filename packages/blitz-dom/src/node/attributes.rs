@@ -25,6 +25,11 @@ impl Attributes {
         self.inner.iter().find(|attr| attr.name == *name)
     }
 
+    /// Whether `name` is set to exactly `value`.
+    pub fn has_value(&self, name: &QualName, value: &str) -> bool {
+        self.inner.iter().any(|attr| attr.name == *name && attr.value == value)
+    }
+
     pub fn set(&mut self, name: QualName, value: &str) {
         let existing_attr = self.inner.iter_mut().find(|a| a.name == name);
         if let Some(existing_attr) = existing_attr {

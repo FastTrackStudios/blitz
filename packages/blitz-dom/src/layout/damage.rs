@@ -27,6 +27,12 @@ pub(crate) const CONSTRUCT_DESCENDENT: RestyleDamage =
 pub(crate) const ONLY_RELAYOUT: RestyleDamage =
     RestyleDamage::from_bits_retain(0b_0000_0000_0000_1000);
 
+/// FTS: set by [`compute_layout_damage`] on a restyle that stylo counted
+/// as relayout but whose layout styles are all unchanged; `resolve` takes
+/// the relayout bit off such a node. Never part of [`ALL_DAMAGE`].
+pub(crate) const LAYOUT_UNCHANGED: RestyleDamage =
+    RestyleDamage::from_bits_retain(0b_0000_0000_1000_0000);
+
 pub(crate) const ALL_DAMAGE: RestyleDamage =
     RestyleDamage::from_bits_retain(0b_0000_0000_0111_1111);
 
@@ -288,10 +294,33 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
         clippy::if_same_then_else,
         reason = "these branches will soon be different"
     )]
+    // FTS: nothing that places or sizes a box changed (a colour, a
+    // shadow, an opacity, a transform): mark it, so `resolve` repaints
+    // instead of laying out again (stylo ORs this into its own RELAYOUT, so
+    // returning REPAINT alone would change nothing). Without this every
+    // paint-only restyle — a blinking lamp, a glow, each frame of a
+    // transition — relaid the document out from the root.
+    let layout_unchanged = || {
+        old.get_box() == new.get_box()
+            && old.get_position() == new.get_position()
+            && old.get_margin() == new.get_margin()
+            && old.get_padding() == new.get_padding()
+            && old.get_border() == new.get_border()
+            && old.get_font() == new.get_font()
+            && old.get_inherited_text() == new.get_inherited_text()
+            && old.get_text() == new.get_text()
+            && old.get_inherited_box() == new.get_inherited_box()
+            && old.get_list() == new.get_list()
+            && old.get_table() == new.get_table()
+            && old.get_inherited_table() == new.get_inherited_table()
+    };
+
     if box_tree_needs_rebuild() {
         ALL_DAMAGE
     } else if text_shaping_needs_recollect() {
         ALL_DAMAGE
+    } else if layout_unchanged() {
+        RestyleDamage::REPAINT | LAYOUT_UNCHANGED
     } else {
         // This element needs to be laid out again, but does not have any damage to
         // its box. In the future, we will distinguish between types of damage to the
