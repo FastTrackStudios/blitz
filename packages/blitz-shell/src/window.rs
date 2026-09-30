@@ -348,23 +348,54 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 
     pub fn poll(&mut self) -> bool {
-        if let Some(waker) = &self.waker {
-            let cx = std::task::Context::from_waker(waker);
-            if self.doc.poll(Some(cx)) {
-                #[cfg(feature = "accessibility")]
-                {
-                    let inner = self.doc.inner();
-                    if inner.has_changes() {
-                        self.accessibility.update_tree(&inner);
-                    }
-                }
+        let Some(waker) = self.waker.clone() else {
+            return false;
+        };
+        // FTS: poll until the runtime is waiting again. A poll that finds
+        // work runs it and returns without leaving a waker behind; only a
+        // poll that comes back pending arms the next wake-up. Stopping after
+        // one worked only while every redraw's window event polled again
+        // (so the window never stopped redrawing); a window that goes quiet
+        // would never hear its timers. Bounded, and continued through the
+        // event loop, so a runtime that is always busy can't starve it.
+        let mut worked = false;
+        let mut rounds = 0;
+        loop {
+            let cx = std::task::Context::from_waker(&waker);
+            if !self.doc.poll(Some(cx)) {
+                break;
+            }
+            worked = true;
+            rounds += 1;
+            if rounds == 8 {
+                let window_id = self.window.id();
+                self.proxy.send_event(BlitzShellEvent::Poll { window_id });
+                break;
+            }
+        }
+        if !worked {
+            return false;
+        }
 
-                self.request_paced_redraw();
-                return true;
+        #[cfg(feature = "accessibility")]
+        {
+            let inner = self.doc.inner();
+            if inner.has_changes() {
+                self.accessibility.update_tree(&inner);
             }
         }
 
-        false
+        // FTS: a poll is often just a timer or a stream waking the runtime
+        // and changing nothing; only a mutation or a widget with something
+        // new to draw is worth a frame.
+        let wanted = {
+            let mut inner = self.doc.inner_mut();
+            inner.take_mutated() | inner.widgets_need_redraw()
+        };
+        if wanted {
+            self.request_paced_redraw();
+        }
+        true
     }
 
     /// A redraw for a document update, paced to `FTS_MAX_FPS` (30 unless
@@ -478,6 +509,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             u64::try_from(frame_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             core::sync::atomic::Ordering::Relaxed,
         );
+        self.pacing.log_frame(frame_started.elapsed());
 
         // FTS: `FTS_FORCE_REDRAW=1` keeps asking for the next frame
         // whether or not the document thinks it is animating, which is
@@ -487,6 +519,11 @@ impl<Rend: WindowRenderer> View<Rend> {
         let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
         if !is_blocked && is_visible && (is_animating || forced) {
             self.request_redraw();
+        } else if !is_blocked && is_visible && self.doc.inner().widgets_need_redraw() {
+            // FTS: a widget still moving (a face's spring settling, an LFO
+            // lamp) asks for the next frame, at the paced rate. A still one
+            // doesn't, and the window sleeps.
+            self.request_paced_redraw();
         }
     }
 
@@ -915,6 +952,15 @@ struct Pacing {
     last_frame: Instant,
     pending: Arc<std::sync::atomic::AtomicBool>,
     timer: Option<std::sync::mpsc::Sender<(Duration, usize)>>,
+    /// `FTS_FPS_LOG=1`: frames and their mean and worst cost, each second.
+    log: Option<FrameLog>,
+}
+
+struct FrameLog {
+    since: Instant,
+    frames: u32,
+    busy: Duration,
+    worst: Duration,
 }
 
 impl Pacing {
@@ -930,6 +976,28 @@ impl Pacing {
             last_frame: Instant::now(),
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             timer: None,
+            log: std::env::var_os("FTS_FPS_LOG").map(|_| FrameLog {
+                since: Instant::now(),
+                frames: 0,
+                busy: Duration::ZERO,
+                worst: Duration::ZERO,
+            }),
+        }
+    }
+
+    fn log_frame(&mut self, took: Duration) {
+        let Some(log) = self.log.as_mut() else { return };
+        log.frames += 1;
+        log.busy += took;
+        log.worst = log.worst.max(took);
+        if log.since.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "fps {:>3}  frame {:>5.2} ms mean  {:>5.2} ms worst",
+                log.frames,
+                log.busy.as_secs_f64() * 1000.0 / f64::from(log.frames.max(1)),
+                log.worst.as_secs_f64() * 1000.0,
+            );
+            *log = FrameLog { since: Instant::now(), frames: 0, busy: Duration::ZERO, worst: Duration::ZERO };
         }
     }
 }

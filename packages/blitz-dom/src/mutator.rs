@@ -55,6 +55,9 @@ pub struct DocumentMutator<'doc> {
     /// Whether an element/attribute that affect animation status has been seen
     recompute_is_animating: bool,
 
+    /// FTS: whether any mutation was made (see `BaseDocument::take_mutated`).
+    touched: bool,
+
     /// The (latest) node which has been mounted in and had autofocus=true, if any
     #[cfg(feature = "autofocus")]
     node_to_autofocus: Option<usize>,
@@ -75,6 +78,7 @@ impl DocumentMutator<'_> {
             style_nodes: HashSet::new(),
             form_nodes: HashSet::new(),
             recompute_is_animating: false,
+            touched: false,
             #[cfg(feature = "autofocus")]
             node_to_autofocus: None,
         }
@@ -122,14 +126,17 @@ impl DocumentMutator<'_> {
     // Node creation methods
 
     pub fn create_comment_node(&mut self) -> usize {
+        self.touched = true;
         self.doc.create_node(NodeData::Comment)
     }
 
     pub fn create_text_node(&mut self, text: &str) -> usize {
+        self.touched = true;
         self.doc.create_text_node(text)
     }
 
     pub fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>) -> usize {
+        self.touched = true;
         let mut data = ElementData::new(name, attrs);
         data.flush_style_attribute(self.doc.guard(), &self.doc.url.url_extra_data());
 
@@ -146,12 +153,14 @@ impl DocumentMutator<'_> {
     }
 
     pub fn deep_clone_node(&mut self, node_id: usize) -> usize {
+        self.touched = true;
         self.doc.deep_clone_node(node_id)
     }
 
     // Node mutation methods
 
     pub fn set_node_text(&mut self, node_id: usize, value: &str) {
+        self.touched = true;
         let node = &mut self.doc.nodes[node_id];
 
         let text = match node.data {
@@ -182,6 +191,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn append_text_to_node(&mut self, node_id: usize, text: &str) -> Result<(), AppendTextErr> {
+        self.touched = true;
         let node = &mut self.doc.nodes[node_id];
         node.insert_damage(ALL_DAMAGE);
         node.mark_ancestors_dirty();
@@ -195,6 +205,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn add_attrs_if_missing(&mut self, node_id: usize, attrs: Vec<Attribute>) {
+        self.touched = true;
         let node = &mut self.doc.nodes[node_id];
         node.insert_damage(ALL_DAMAGE);
         let element_data = node.element_data_mut().expect("Not an element");
@@ -214,6 +225,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn set_attribute(&mut self, node_id: usize, name: QualName, value: &str) {
+        self.touched = true;
         // Setting an attribute to the value it already has changes nothing:
         // no restyle, no damage, no relayout from the root.
         if let NodeData::Element(el) = &self.doc.nodes[node_id].data
@@ -352,6 +364,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn clear_attribute(&mut self, node_id: usize, name: QualName) {
+        self.touched = true;
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_node(node_id);
@@ -423,33 +436,40 @@ impl DocumentMutator<'_> {
     }
 
     pub fn set_style_property(&mut self, node_id: usize, name: &str, value: &str) {
+        self.touched = true;
         self.doc.set_style_property(node_id, name, value)
     }
 
     pub fn remove_style_property(&mut self, node_id: usize, name: &str) {
+        self.touched = true;
         self.doc.remove_style_property(node_id, name)
     }
 
     pub fn set_sub_document(&mut self, node_id: usize, sub_document: Box<dyn Document>) {
+        self.touched = true;
         self.doc.set_sub_document(node_id, sub_document)
     }
 
     pub fn remove_sub_document(&mut self, node_id: usize) {
+        self.touched = true;
         self.doc.remove_sub_document(node_id)
     }
 
     #[cfg(feature = "custom-widget")]
     pub fn set_custom_widget(&mut self, node_id: usize, widget: Box<dyn crate::Widget>) {
+        self.touched = true;
         self.doc.set_custom_widget(node_id, widget)
     }
 
     #[cfg(feature = "custom-widget")]
     pub fn remove_custom_widget(&mut self, node_id: usize) {
+        self.touched = true;
         self.doc.remove_custom_widget(node_id)
     }
 
     /// Remove the node from it's parent but don't drop it
     pub fn remove_node(&mut self, node_id: usize) {
+        self.touched = true;
         let node = &mut self.doc.nodes[node_id];
 
         // Update child_idx values
@@ -466,6 +486,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn remove_and_drop_node(&mut self, node_id: usize) -> Option<Node> {
+        self.touched = true;
         self.process_removed_subtree(node_id);
 
         let node = self.doc.drop_node_ignoring_parent(node_id);
@@ -493,6 +514,7 @@ impl DocumentMutator<'_> {
     }
 
     pub fn remove_and_drop_all_children(&mut self, node_id: usize) {
+        self.touched = true;
         let parent = &mut self.doc.nodes[node_id];
         let parent_is_in_doc = parent.flags.is_in_document();
 
@@ -515,6 +537,7 @@ impl DocumentMutator<'_> {
 
     // Tree mutation methods
     pub fn remove_node_if_unparented(&mut self, node_id: usize) {
+        self.touched = true;
         if let Some(node) = self.doc.get_node(node_id) {
             if node.parent.is_none() {
                 self.remove_and_drop_node(node_id);
@@ -524,12 +547,14 @@ impl DocumentMutator<'_> {
 
     /// Remove all of the children from old_parent_id and append them to new_parent_id
     pub fn append_children(&mut self, parent_id: usize, child_ids: &[usize]) {
+        self.touched = true;
         self.add_children_to_parent(parent_id, child_ids, &|parent, child_ids| {
             parent.children.extend_from_slice(child_ids);
         });
     }
 
     pub fn insert_nodes_before(&mut self, anchor_node_id: usize, new_node_ids: &[usize]) {
+        self.touched = true;
         let parent_id = self.doc.nodes[anchor_node_id].parent.unwrap();
         self.add_children_to_parent(parent_id, new_node_ids, &|parent, child_ids| {
             let node_child_idx = parent.index_of_child(anchor_node_id).unwrap();
@@ -604,6 +629,7 @@ impl DocumentMutator<'_> {
 
     // Tree mutation methods (that defer to other methods)
     pub fn insert_nodes_after(&mut self, anchor_node_id: usize, new_node_ids: &[usize]) {
+        self.touched = true;
         match self.next_sibling_id(anchor_node_id) {
             Some(id) => self.insert_nodes_before(id, new_node_ids),
             None => {
@@ -614,12 +640,14 @@ impl DocumentMutator<'_> {
     }
 
     pub fn reparent_children(&mut self, old_parent_id: usize, new_parent_id: usize) {
+        self.touched = true;
         let child_ids = std::mem::take(&mut self.doc.nodes[old_parent_id].children);
         self.maybe_record_node(old_parent_id);
         self.append_children(new_parent_id, &child_ids);
     }
 
     pub fn replace_node_with(&mut self, anchor_node_id: usize, new_node_ids: &[usize]) {
+        self.touched = true;
         self.insert_nodes_before(anchor_node_id, new_node_ids);
         self.remove_node(anchor_node_id);
     }
@@ -627,6 +655,9 @@ impl DocumentMutator<'_> {
 
 impl<'doc> DocumentMutator<'doc> {
     pub fn flush(&mut self) {
+        if self.touched {
+            self.doc.mutated = true;
+        }
         if self.recompute_is_animating {
             self.doc.has_canvas = self.doc.compute_has_canvas();
         }
@@ -654,6 +685,7 @@ impl<'doc> DocumentMutator<'doc> {
     }
 
     pub fn set_inner_html(&mut self, node_id: usize, html: &str) {
+        self.touched = true;
         self.remove_and_drop_all_children(node_id);
         self.doc
             .html_parser_provider
