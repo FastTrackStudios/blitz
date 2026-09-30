@@ -409,6 +409,8 @@ pub struct BaseDocument {
     /// Nodes that contain custom widgets
     #[cfg(feature = "custom-widget")]
     pub(crate) custom_widget_nodes: HashSet<NodeId>,
+    /// FTS: the DOM was mutated since [`Self::take_mutated`] last asked.
+    pub(crate) mutated: bool,
     /// Rendering resources allocated by custom widgets that should be deallocated during the next render
     #[cfg(feature = "custom-widget")]
     pub(crate) pending_resource_deallocations: Vec<anyrender::ResourceId>,
@@ -553,6 +555,7 @@ impl BaseDocument {
 
             #[cfg(feature = "custom-widget")]
             custom_widget_nodes: HashSet::new(),
+            mutated: false,
             #[cfg(feature = "custom-widget")]
             pending_resource_deallocations: Vec::new(),
 
@@ -1085,6 +1088,33 @@ impl BaseDocument {
     }
 
     /// Whether the document has been mutated
+    /// FTS: whether the DOM was mutated since the last call. A host polls
+    /// its UI runtime for many reasons (a timer, a stream) that change
+    /// nothing; only a mutation — or a widget with something new to draw
+    /// ([`Self::widgets_need_redraw`]) — is worth a frame.
+    pub fn take_mutated(&mut self) -> bool {
+        std::mem::take(&mut self.mutated)
+    }
+
+    /// FTS: whether any custom widget has something new to draw (its
+    /// [`Widget::needs_redraw`](crate::Widget::needs_redraw)): a value
+    /// set on it, or a picture that is moving.
+    #[cfg(feature = "custom-widget")]
+    pub fn widgets_need_redraw(&self) -> bool {
+        self.custom_widget_nodes.iter().any(|&id| {
+            self.nodes
+                .get(id)
+                .and_then(|n| n.element_data())
+                .and_then(|el| el.custom_widget_data())
+                .is_some_and(|w| w.widget.needs_redraw())
+        })
+    }
+
+    #[cfg(not(feature = "custom-widget"))]
+    pub fn widgets_need_redraw(&self) -> bool {
+        false
+    }
+
     pub fn has_changes(&self) -> bool {
         self.changed_nodes.is_empty()
     }

@@ -1023,6 +1023,10 @@ impl DocumentMutator<'_> {
 
 impl<'doc> DocumentMutator<'doc> {
     pub fn flush(&mut self) {
+        // FTS: recorded for `BaseDocument::take_mutated`.
+        if self.mutations_occurred {
+            self.doc.mutated = true;
+        }
         if self.recompute_is_animating {
             self.doc.has_canvas = self.doc.compute_has_canvas();
         }
