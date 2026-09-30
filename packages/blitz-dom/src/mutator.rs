@@ -274,7 +274,7 @@ impl DocumentMutator<'_> {
 
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         // Setting an attribute to the value it already has changes nothing:
-        // no restyle, no damage, no relayout from the root.
+        // no restyle, no damage, no relayout from the root — and no frame.
         if let NodeData::Element(el) = &self.doc.nodes[node_id].data
             && el.attrs.has_value(&name, value)
         {

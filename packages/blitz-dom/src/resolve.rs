@@ -145,6 +145,7 @@ impl BaseDocument {
             any_damage |= !damage.is_empty();
             needs_layout |= !(damage - paint_only).is_empty();
         }
+        self.resolve_damaged = !skip_allowed || any_damage;
         if skip_allowed && !any_damage {
             // Pending style images still flush (a restyle that changed only
             // a background image reports no damage of its own here).
