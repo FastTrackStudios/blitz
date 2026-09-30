@@ -116,6 +116,7 @@ impl BaseDocument {
             any_damage |= !damage.is_empty();
             needs_layout |= !(damage - paint_only).is_empty();
         }
+        self.resolve_damaged = !skip_allowed || any_damage;
         if skip_allowed && !any_damage {
             for (_, node) in self.nodes.iter_mut() {
                 node.unset_dirty_descendants();

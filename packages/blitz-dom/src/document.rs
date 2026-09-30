@@ -292,6 +292,13 @@ pub struct BaseDocument {
     pub(crate) custom_widget_nodes: HashSet<usize>,
     /// FTS: the DOM was mutated since [`Self::take_mutated`] last asked.
     pub(crate) mutated: bool,
+    /// FTS: the last `resolve` found damage: restyled, relaid out or
+    /// repainted nodes, so the page must be painted again.
+    pub(crate) resolve_damaged: bool,
+    /// FTS: which custom widgets are drawn as composited layers (see
+    /// [`CompositeState`]). The painter keeps it; the shell reads it.
+    #[cfg(feature = "custom-widget")]
+    pub composite: CompositeState,
     /// Rendering resources allocated by custom widgets that should be deallocated during the next render
     #[cfg(feature = "custom-widget")]
     pub(crate) pending_resource_deallocations: Vec<anyrender::ResourceId>,
@@ -459,6 +466,9 @@ impl BaseDocument {
             #[cfg(feature = "custom-widget")]
             custom_widget_nodes: HashSet::new(),
             mutated: false,
+            resolve_damaged: true,
+            #[cfg(feature = "custom-widget")]
+            composite: CompositeState::default(),
             #[cfg(feature = "custom-widget")]
             pending_resource_deallocations: Vec::new(),
 
@@ -879,6 +889,17 @@ impl BaseDocument {
         std::mem::take(&mut self.mutated)
     }
 
+    /// FTS: the node under the pointer, if any.
+    pub fn hovered_node_id(&self) -> Option<usize> {
+        self.hover_node_id
+    }
+
+    /// FTS: whether the last [`Self::resolve`] found anything to restyle,
+    /// lay out or repaint.
+    pub fn resolve_damaged(&self) -> bool {
+        self.resolve_damaged
+    }
+
     /// FTS: whether any custom widget has something new to draw (its
     /// [`Widget::needs_redraw`](crate::Widget::needs_redraw)): a value
     /// set on it, or a picture that is moving.
@@ -896,6 +917,23 @@ impl BaseDocument {
     #[cfg(not(feature = "custom-widget"))]
     pub fn widgets_need_redraw(&self) -> bool {
         false
+    }
+
+    /// FTS: whether a widget that is *not* drawn as a layer needs a redraw
+    /// (so the page must be painted, not just its layers).
+    #[cfg(feature = "custom-widget")]
+    pub fn page_widgets_need_redraw(&self) -> bool {
+        let layers = self.composite.placed.borrow();
+        let visible = self.composite.visible.borrow();
+        // A texture widget that wasn't drawn (culled) changes nothing seen.
+        let seen = |id: &usize| visible.contains(id) || !self.composite.widgets.borrow().contains(id);
+        self.custom_widget_nodes.iter().filter(|id| !layers.contains_key(id) && seen(id)).any(|&id| {
+            self.nodes
+                .get(id)
+                .and_then(|n| n.element_data())
+                .and_then(|el| el.custom_widget_data())
+                .is_some_and(|w| w.widget.needs_redraw())
+        })
     }
 
     pub fn has_changes(&self) -> bool {
@@ -2494,4 +2532,29 @@ mod font_face_override_tests {
              not the font file's internal `name` table entry",
         );
     }
+}
+
+/// FTS: the custom widgets drawn as composited layers, carried from one
+/// painted frame to the next.
+///
+/// Whether a widget can be a layer is only known once the page is painted
+/// (is anything painted over it?), so each paint composites the widgets the
+/// previous paint found free and records which are free now. When the two
+/// differ the set is *unsettled* and the next frame paints again.
+#[cfg(feature = "custom-widget")]
+#[derive(Default)]
+pub struct CompositeState {
+    /// Widget nodes to composite (found free by the last paint).
+    pub widgets: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// The layers the last paint drew, in order: what a frame that reuses
+    /// the page draws over it.
+    pub layers: std::cell::RefCell<Vec<anyrender::composite::Layer>>,
+    /// The widgets the last paint drew as layers, and their textures: all
+    /// a frame that reuses the page repaints.
+    pub placed: std::cell::RefCell<std::collections::HashMap<usize, anyrender::ResourceId>>,
+    /// The texture widgets the last paint drew at all (not culled): only
+    /// these being redrawn changes what the page shows.
+    pub visible: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// The last paint changed `widgets`: paint once more.
+    pub unsettled: std::cell::Cell<bool>,
 }

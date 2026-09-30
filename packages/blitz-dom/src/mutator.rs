@@ -225,14 +225,14 @@ impl DocumentMutator<'_> {
     }
 
     pub fn set_attribute(&mut self, node_id: usize, name: QualName, value: &str) {
-        self.touched = true;
         // Setting an attribute to the value it already has changes nothing:
-        // no restyle, no damage, no relayout from the root.
+        // no restyle, no damage, no relayout from the root — and no frame.
         if let NodeData::Element(el) = &self.doc.nodes[node_id].data
             && el.attrs.has_value(&name, value)
         {
             return;
         }
+        self.touched = true;
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_node(node_id);

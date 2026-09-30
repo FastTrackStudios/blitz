@@ -98,6 +98,9 @@ pub struct View<Rend: WindowRenderer> {
     pub animation_timer: Option<Instant>,
     /// FTS: redraw pacing for document updates (see `request_paced_redraw`).
     pacing: Pacing,
+    /// FTS: the next frame must paint the page, not just its layers: the
+    /// DOM changed, or an event may have changed what the page shows.
+    paint_page: bool,
     pub is_visible: bool,
     pub safe_area_insets: PhysicalInsets<u32>,
 
@@ -213,6 +216,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             resize_timer_scheduled: false,
             pointer_pos: Default::default(),
             pacing: Pacing::from_env(),
+            paint_page: true,
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
             accessibility,
@@ -319,7 +323,7 @@ impl<Rend: WindowRenderer> View<Rend> {
         let insets = self.safe_area_insets.to_logical(scale);
 
         #[cfg(feature = "custom-widget")]
-        inner.can_create_surfaces(&self.renderer as _);
+        inner.can_create_surfaces(&mut self.renderer as _);
 
         self.renderer.set_size(width, height);
 
@@ -388,10 +392,12 @@ impl<Rend: WindowRenderer> View<Rend> {
         // FTS: a poll is often just a timer or a stream waking the runtime
         // and changing nothing; only a mutation or a widget with something
         // new to draw is worth a frame.
-        let wanted = {
+        let (mutated, widgets) = {
             let mut inner = self.doc.inner_mut();
-            inner.take_mutated() | inner.widgets_need_redraw()
+            (inner.take_mutated(), inner.widgets_need_redraw())
         };
+        self.paint_page |= mutated;
+        let wanted = mutated | widgets;
         if wanted {
             self.request_paced_redraw();
         }
@@ -475,6 +481,23 @@ impl<Rend: WindowRenderer> View<Rend> {
             // number and a slow frame says nothing about which half.
             let started = std::time::Instant::now();
             let mut encoded = std::time::Duration::ZERO;
+            // FTS: nothing changed but widgets drawn as layers: paint just
+            // those, and let the renderer put them over the page it kept.
+            #[cfg(feature = "custom-widget")]
+            {
+                let layers_only = anyrender::composite::supported()
+                    && !self.paint_page
+                    && !is_animating
+                    && !inner.resolve_damaged()
+                    && !inner.composite.unsettled.get()
+                    && !inner.composite.placed.borrow().is_empty()
+                    && !inner.page_widgets_need_redraw();
+                let reuse = layers_only
+                    && blitz_paint::paint_composited_widgets(&mut inner, &mut self.renderer, scale);
+                let layers = if reuse { inner.composite.layers.borrow().clone() } else { Vec::new() };
+                anyrender::composite::begin(reuse, layers);
+            }
+            self.paint_page = false;
             self.renderer.render(|scene| {
                 let at = std::time::Instant::now();
                 paint_scene(
@@ -509,13 +532,28 @@ impl<Rend: WindowRenderer> View<Rend> {
             u64::try_from(frame_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             core::sync::atomic::Ordering::Relaxed,
         );
-        self.pacing.log_frame(frame_started.elapsed());
+        #[cfg(feature = "custom-widget")]
+        let (layers_only, layers) = (
+            anyrender::composite::reused(),
+            self.doc.inner().composite.placed.borrow().len(),
+        );
+        #[cfg(not(feature = "custom-widget"))]
+        let (layers_only, layers) = (false, 0);
+        self.pacing.log_frame(frame_started.elapsed(), layers_only, layers);
 
         // FTS: `FTS_FORCE_REDRAW=1` keeps asking for the next frame
         // whether or not the document thinks it is animating, which is
         // what makes a window measurable: a render loop that runs at the
         // machine's own pace, rather than one that only advances when
         // somebody moves a mouse over it.
+        // FTS: the last paint changed which widgets are layers: once more,
+        // so they are drawn as the new set says.
+        #[cfg(feature = "custom-widget")]
+        if self.doc.inner().composite.unsettled.get() {
+            self.paint_page = true;
+            self.request_paced_redraw();
+        }
+
         let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
         if !is_blocked && is_visible && (is_animating || forced) {
             self.request_redraw();
@@ -675,6 +713,30 @@ impl<Rend: WindowRenderer> View<Rend> {
         #[cfg(feature = "accessibility")]
         self.accessibility
             .process_window_event(&*self.window, &event);
+
+        // FTS: an event may change what the page shows without the DOM
+        // changing (a selection, a scroll, a focus ring): paint the page.
+        // Moving the pointer with no button held only restyles (hover),
+        // which `resolve` sees; dragging over a layer (a face's knob) only
+        // changes the layer.
+        match &event {
+            WindowEvent::RedrawRequested | WindowEvent::Moved(_) | WindowEvent::ActivationTokenDone { .. } => {}
+            WindowEvent::PointerMoved { .. } => {
+                if self.buttons != MouseEventButtons::None {
+                    #[cfg(feature = "custom-widget")]
+                    let over_layer = {
+                        let inner = self.doc.inner();
+                        inner
+                            .hovered_node_id()
+                            .is_some_and(|id| inner.composite.placed.borrow().contains_key(&id))
+                    };
+                    #[cfg(not(feature = "custom-widget"))]
+                    let over_layer = false;
+                    self.paint_page |= !over_layer;
+                }
+            }
+            _ => self.paint_page = true,
+        }
 
         match event {
             WindowEvent::Destroyed => {}
@@ -959,6 +1021,9 @@ struct Pacing {
 struct FrameLog {
     since: Instant,
     frames: u32,
+    /// Frames that only drew layers over the kept page.
+    layers_only: u32,
+    layers: usize,
     busy: Duration,
     worst: Duration,
 }
@@ -979,25 +1044,38 @@ impl Pacing {
             log: std::env::var_os("FTS_FPS_LOG").map(|_| FrameLog {
                 since: Instant::now(),
                 frames: 0,
+                layers_only: 0,
+                layers: 0,
                 busy: Duration::ZERO,
                 worst: Duration::ZERO,
             }),
         }
     }
 
-    fn log_frame(&mut self, took: Duration) {
+    fn log_frame(&mut self, took: Duration, layers_only: bool, layers: usize) {
         let Some(log) = self.log.as_mut() else { return };
         log.frames += 1;
+        log.layers_only += u32::from(layers_only);
+        log.layers = layers;
         log.busy += took;
         log.worst = log.worst.max(took);
         if log.since.elapsed() >= Duration::from_secs(1) {
             eprintln!(
-                "fps {:>3}  frame {:>5.2} ms mean  {:>5.2} ms worst",
+                "fps {:>3} ({:>3} layers only, {} layers)  frame {:>5.2} ms mean  {:>5.2} ms worst",
                 log.frames,
+                log.layers_only,
+                log.layers,
                 log.busy.as_secs_f64() * 1000.0 / f64::from(log.frames.max(1)),
                 log.worst.as_secs_f64() * 1000.0,
             );
-            *log = FrameLog { since: Instant::now(), frames: 0, busy: Duration::ZERO, worst: Duration::ZERO };
+            *log = FrameLog {
+                since: Instant::now(),
+                frames: 0,
+                layers_only: 0,
+                layers: 0,
+                busy: Duration::ZERO,
+                worst: Duration::ZERO,
+            };
         }
     }
 }

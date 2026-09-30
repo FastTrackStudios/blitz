@@ -118,6 +118,19 @@ pub trait Widget {
         false
     }
 
+    /// FTS: the one registered texture this widget's picture is, filling
+    /// its box, if it is exactly that (a frame face, a video).
+    ///
+    /// Such a widget can be *composited*: left out of the page scene and
+    /// drawn over the page from its texture, so a frame where only it
+    /// changed repaints it alone (see `anyrender::composite`). Its `paint`
+    /// is still called every frame it is drawn, to update the texture, and
+    /// still returns the scene that draws it, for when it can't be
+    /// composited (under a transform or an opacity, or painted over).
+    fn composite_texture(&self) -> Option<ResourceId> {
+        None
+    }
+
     /// Callback for the widget to paint it's content.
     ///
     /// Output is recorded to an AnyRender `Scene`.

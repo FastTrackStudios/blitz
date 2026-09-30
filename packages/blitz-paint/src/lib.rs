@@ -3,6 +3,8 @@
 
 #![allow(clippy::collapsible_if)]
 
+#[cfg(feature = "custom-widget")]
+mod composite;
 mod color;
 mod debug_overlay;
 mod filters;
@@ -63,9 +65,19 @@ pub fn paint_scene(
     #[allow(unused_mut)]
     let custom_widget_scenes: CustomWidgetSceneMap = RefCell::new(HashMap::new());
     #[cfg(feature = "custom-widget")]
-    build_custom_widget_scenes(&mut custom_widget_scenes.borrow_mut(), doc, scene, scale);
+    let textures = {
+        let mut textures = HashMap::new();
+        build_custom_widget_scenes(&mut custom_widget_scenes.borrow_mut(), &mut textures, doc, scene, scale);
+        textures
+    };
 
-    let generator = BlitzDomPainter::new(
+    // FTS: texture widgets become layers when the renderer composites.
+    #[cfg(feature = "custom-widget")]
+    let compositing = anyrender::composite::supported()
+        .then(|| composite::Compositing::new(doc, textures));
+
+    #[allow(unused_mut)]
+    let mut generator = BlitzDomPainter::new(
         doc,
         scale,
         width,
@@ -74,7 +86,15 @@ pub fn paint_scene(
         y_offset as f64,
         &custom_widget_scenes,
     );
+    #[cfg(feature = "custom-widget")]
+    {
+        generator.compositing = compositing.as_ref();
+    }
     generator.paint_scene(scene);
+    #[cfg(feature = "custom-widget")]
+    if let Some(compositing) = compositing {
+        compositing.finish(doc);
+    }
 
     // println!(
     //     "Rendered using {} clips (depth: {}) (wanted: {})",
@@ -87,6 +107,7 @@ pub fn paint_scene(
 #[cfg(feature = "custom-widget")]
 fn build_custom_widget_scenes(
     custom_widget_scenes: &mut HashMap<(usize, usize), Scene>,
+    textures: &mut HashMap<usize, anyrender::ResourceId>,
     doc: &mut BaseDocument,
     render_ctx: &mut impl anyrender::RenderContext,
     scale: f64,
@@ -96,8 +117,12 @@ fn build_custom_widget_scenes(
     // Process scenes for every custom widget in the document
     let custom_widget_node_ids = doc.custom_widget_node_ids();
     for node_id in custom_widget_node_ids.into_iter() {
-        if let Some(scene) = process_custom_widget_node(doc, render_ctx, node_id, scale) {
+        if let Some((scene, texture)) = process_custom_widget_node(doc, render_ctx, node_id, scale) {
             custom_widget_scenes.insert((doc_id, node_id), scene);
+            // FTS: only the root document's widgets are layers.
+            if let Some(texture) = texture {
+                textures.insert(node_id, texture);
+            }
         }
     }
 
@@ -106,9 +131,38 @@ fn build_custom_widget_scenes(
     for node_id in sub_document_node_ids.into_iter() {
         if let Some(sub_doc) = doc.get_node_mut(node_id).and_then(|node| node.subdoc_mut()) {
             let mut inner = sub_doc.inner_mut();
-            build_custom_widget_scenes(custom_widget_scenes, &mut inner, render_ctx, scale);
+            build_custom_widget_scenes(custom_widget_scenes, &mut HashMap::new(), &mut inner, render_ctx, scale);
         }
     }
+}
+
+/// FTS: paint only the widgets drawn as layers (updating their textures),
+/// for a frame that reuses the page: nothing else changed. False when a
+/// layer can't be drawn as it was (its texture or size changed): paint the
+/// page instead.
+#[cfg(feature = "custom-widget")]
+pub fn paint_composited_widgets(
+    doc: &mut BaseDocument,
+    render_ctx: &mut impl anyrender::RenderContext,
+    scale: f64,
+) -> bool {
+    let placed: Vec<(usize, anyrender::ResourceId)> =
+        doc.composite.placed.borrow().iter().map(|(n, r)| (*n, *r)).collect();
+    let mut ok = true;
+    for (node_id, texture) in placed {
+        // Unchanged: its texture already shows it.
+        let wants = doc
+            .get_node(node_id)
+            .and_then(|n| n.element_data())
+            .and_then(|el| el.custom_widget_data())
+            .is_some_and(|w| w.widget.needs_redraw());
+        if !wants {
+            continue;
+        }
+        match process_custom_widget_node(doc, render_ctx, node_id, scale) {
+        }
+    }
+    ok
 }
 
 #[cfg(feature = "custom-widget")]
@@ -117,7 +171,7 @@ fn process_custom_widget_node(
     render_ctx: &mut impl anyrender::RenderContext,
     node_id: usize,
     scale: f64,
-) -> Option<Scene> {
+) -> Option<(Scene, Option<anyrender::ResourceId>)> {
     use blitz_dom::node::{CustomWidgetStatus, ProxyRenderContext};
 
     let node = doc.get_node_mut(node_id)?;
@@ -146,5 +200,5 @@ fn process_custom_widget_node(
         .widget
         .paint(&mut render_ctx, &style, width, height, scale);
 
-    Some(widget_scene)
+    Some((widget_scene, widget_data.widget.composite_texture()))
 }
