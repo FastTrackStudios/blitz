@@ -160,6 +160,8 @@ pub fn paint_composited_widgets(
             continue;
         }
         match process_custom_widget_node(doc, render_ctx, node_id, scale) {
+            Some((_, Some(now))) => ok &= now == texture,
+            _ => ok = false,
         }
     }
     ok
