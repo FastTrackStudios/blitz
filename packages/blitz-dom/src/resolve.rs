@@ -8,6 +8,7 @@ use kurbo::{Affine, Rect};
 use parley::LayoutContext;
 use selectors::Element as _;
 use style::dom::TDocument;
+use style::selector_parser::RestyleDamage;
 
 #[cfg(feature = "parallel-construct")]
 use rayon::prelude::*;
@@ -28,7 +29,10 @@ use crate::{
             ConstructionTask, ConstructionTaskData, ConstructionTaskResult,
             ConstructionTaskResultData, LayoutChildren, collect_layout_children,
         },
-        damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
+        damage::{
+            ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC, LAYOUT_UNCHANGED,
+            ONLY_RELAYOUT,
+        },
         inline::build_inline_layout_into,
     },
     node::TextBrush,
@@ -86,6 +90,8 @@ impl BaseDocument {
 
         // Apply any device changes (viewport resize, zoom, color-scheme, etc)
         // accumulated since the last resolve as a single device rebuild.
+        // FTS: read before the flush clears it (see the layout skip below).
+        let device_changed = !self.pending_device_changes.is_empty();
         self.flush_pending_device_changes();
 
         // we need to resolve stylist first since it will need to drive our layout bits
@@ -100,37 +106,93 @@ impl BaseDocument {
             timer.record_time("mark_all");
         }
 
-        // Propagate damage flags (from mutation and restyles) up and down the tree
-        self.propagate_damage_flags(root_node_id);
-        timer.record_time("damage");
+        // FTS: frames with nothing to lay out skip layout.
+        //
+        // - Idle: nothing mutated or restyled. Skip every tree walk and
+        //   just paint. A host with custom widgets repaints on their
+        //   schedule, and each of those frames used to lay the whole
+        //   document out again.
+        // - Paint-only: a colour, a shadow, a transform. Styles are
+        //   resolved and painting reads them directly; only overflow,
+        //   transforms and the paint tree need their pass. Stylo counts
+        //   some of these (a box-shadow) as relayout;
+        //   `compute_layout_damage` marks the ones whose layout styles are
+        //   all unchanged, and the relayout bit comes off them here.
+        //
+        // A device change (a resize, a zoom) moves the available space
+        // without damaging any node, so it always lays out.
+        //
+        // BLITZ_NO_IDLE_SKIP=1 turns both off.
+        let skip_allowed = self.incremental_layout
+            && !device_changed
+            && std::env::var_os("BLITZ_NO_IDLE_SKIP").is_none();
+        let paint_only = RestyleDamage::REPAINT
+            | RestyleDamage::REBUILD_STACKING_CONTEXT
+            | RestyleDamage::RECALCULATE_OVERFLOW;
+        let mut any_damage = false;
+        let mut needs_layout = false;
+        for (_, node) in self.nodes.iter_mut() {
+            let Some(mut damage) = node.damage() else {
+                continue;
+            };
+            if damage.contains(LAYOUT_UNCHANGED) {
+                if !damage.intersects(CONSTRUCT_BOX | CONSTRUCT_FC | CONSTRUCT_DESCENDENT) {
+                    damage.remove(ONLY_RELAYOUT);
+                }
+                damage.remove(LAYOUT_UNCHANGED);
+                node.set_damage(damage);
+            }
+            any_damage |= !damage.is_empty();
+            needs_layout |= !(damage - paint_only).is_empty();
+        }
+        if skip_allowed && !any_damage {
+            // Pending style images still flush (a restyle that changed only
+            // a background image reports no damage of its own here).
+            self.flush_pending_style_images();
+            for (_, node) in self.nodes.iter_mut() {
+                node.unset_dirty_descendants();
+            }
+        } else if skip_allowed && !needs_layout {
+            self.propagate_damage_flags(root_node_id);
+            timer.record_time("damage");
+            self.flush_pending_style_images();
+            self.resolve_transforms(root_node_id);
+            timer.record_time("transform");
+            self.build_paint_tree(root_node_id);
+            timer.record_time("paint_tree");
+        } else {
+            // Propagate damage flags (from mutation and restyles) up and down the tree
+            self.propagate_damage_flags(root_node_id);
+            timer.record_time("damage");
 
-        // Fix up tree for layout (insert anonymous blocks as necessary, etc)
-        self.resolve_layout_children();
-        #[cfg(debug_assertions)]
-        self.assert_layout_parents_consistent();
-        timer.record_time("construct");
+            // Fix up tree for layout (insert anonymous blocks as necessary, etc)
+            self.resolve_layout_children();
+            #[cfg(debug_assertions)]
+            self.assert_layout_parents_consistent();
+            timer.record_time("construct");
 
-        self.resolve_deferred_tasks();
-        // Flush background/mask images from style to dedicated storage on the
-        // nodes whose style changed (queued by the style traversal and by
-        // pseudo-element box construction), fetching any not-yet-loaded images.
-        self.flush_pending_style_images();
-        timer.record_time("pconstruct");
+            self.resolve_deferred_tasks();
+            // Flush background/mask images from style to dedicated storage on the
+            // nodes whose style changed (queued by the style traversal and by
+            // pseudo-element box construction), fetching any not-yet-loaded images.
+            self.flush_pending_style_images();
+            timer.record_time("pconstruct");
 
-        // Next we resolve layout with the data resolved by stlist
-        self.resolve_layout();
-        timer.record_time("layout");
-        self.nodes.bump_geometry_generation();
+            // Next we resolve layout with the data resolved by stlist
+            self.resolve_layout();
+            timer.record_time("layout");
+            self.nodes.bump_geometry_generation();
 
-        // Resolve transforms
-        self.resolve_transforms(root_node_id);
-        timer.record_time("transform");
+            // Resolve transforms
+            self.resolve_transforms(root_node_id);
+            timer.record_time("transform");
 
-        // Build paint children / stacking contexts for damaged subtrees. Runs
-        // after layout and transforms so that stacking-context roots created by
-        // this frame's transforms are picked up, and before damage is cleared.
-        self.build_paint_tree(root_node_id);
-        timer.record_time("paint_tree");
+            // Build paint children / stacking contexts for damaged subtrees. Runs
+            // after layout and transforms so that stacking-context roots created by
+            // this frame's transforms are picked up, and before damage is cleared.
+            self.build_paint_tree(root_node_id);
+            timer.record_time("paint_tree");
+        }
 
         // Clear all damage and dirty flags, walking only subtrees which are
         // marked as (potentially) containing damage.
