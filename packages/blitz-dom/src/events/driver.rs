@@ -162,6 +162,10 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                 let mut doc = self.doc.inner_mut();
                 doc.active_node();
                 doc.set_mousedown_node_id(hover_node_id);
+                #[cfg(feature = "custom-widget")]
+                {
+                    doc.pointer_capture = hover_node_id.filter(|id| doc.custom_widget_nodes.contains(id));
+                }
             }
             UiEvent::PointerUp(event) => {
                 hover_node_id = self.handle_pointer_move(event);
@@ -195,7 +199,18 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             UiEvent::Ime(_) => focussed_node_id,
             UiEvent::AppleStandardKeybinding(_) => focussed_node_id,
         };
+        // FTS: a widget holding the pointer gets its moves and its release,
+        // over it or not.
+        #[cfg(feature = "custom-widget")]
+        let target = match event {
+            UiEvent::PointerMove(_) | UiEvent::PointerUp(_) | UiEvent::PointerCancel(_) => {
+                self.doc.inner().pointer_capture.or(target)
+            }
+            _ => target,
+        };
         let target = target.unwrap_or_else(|| self.doc.inner().root_element().id);
+        #[cfg(feature = "custom-widget")]
+        let releases = matches!(event, UiEvent::PointerUp(_) | UiEvent::PointerCancel(_));
 
         match event {
             UiEvent::PointerMove(data) => {
@@ -255,6 +270,11 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                 self.process_queue();
             }
         };
+
+        #[cfg(feature = "custom-widget")]
+        if releases {
+            self.doc.inner_mut().pointer_capture = None;
+        }
 
         // Update document input state (hover, focus, active, etc)
         if should_clear_hover {

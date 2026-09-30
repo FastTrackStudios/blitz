@@ -290,6 +290,11 @@ pub struct BaseDocument {
     /// Nodes that contain custom widgets
     #[cfg(feature = "custom-widget")]
     pub(crate) custom_widget_nodes: HashSet<usize>,
+    /// FTS: the custom widget a press landed on, holding the pointer until
+    /// it is released: a knob dragged off its face keeps turning, and
+    /// hears the release wherever it happens.
+    #[cfg(feature = "custom-widget")]
+    pub(crate) pointer_capture: Option<usize>,
     /// FTS: the DOM was mutated since [`Self::take_mutated`] last asked.
     pub(crate) mutated: bool,
     /// FTS: the last `resolve` found damage: restyled, relaid out or
@@ -465,6 +470,8 @@ impl BaseDocument {
 
             #[cfg(feature = "custom-widget")]
             custom_widget_nodes: HashSet::new(),
+            #[cfg(feature = "custom-widget")]
+            pointer_capture: None,
             mutated: false,
             resolve_damaged: true,
             #[cfg(feature = "custom-widget")]
