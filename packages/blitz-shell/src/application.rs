@@ -70,7 +70,7 @@ impl<Rend: WindowRenderer> BlitzApplication<Rend> {
             BlitzShellEvent::RequestRedraw { doc_id } => {
                 // TODO: Handle multiple documents per window
                 if let Some(window) = self.window_mut_by_doc_id(doc_id) {
-                    window.request_redraw();
+                    window.frame_now();
                 }
             }
 

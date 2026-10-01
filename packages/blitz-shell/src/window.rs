@@ -452,12 +452,12 @@ impl<Rend: WindowRenderer> View<Rend> {
     /// still redraws at once: it asks the window directly.
     fn request_paced_redraw(&mut self) {
         let Some(min) = self.pacing.min_frame else {
-            self.request_redraw();
+            self.frame_now();
             return;
         };
         let since = self.pacing.last_frame.elapsed();
         if since >= min {
-            self.request_redraw();
+            self.frame_now();
             return;
         }
         if self.pacing.pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -480,6 +480,23 @@ impl<Rend: WindowRenderer> View<Rend> {
             tx
         });
         let _ = tx.send((wait, doc_id));
+    }
+
+    /// FTS: a frame for a document update or a paced tick — drawn now on
+    /// iOS, asked for elsewhere. winit-uikit decides whether a view is
+    /// Metal-backed by asking if the *view* is a `CAMetalLayer`, which a
+    /// UIView never is, so every redraw it is asked for becomes
+    /// `setNeedsDisplay` — and UIKit only turns that into a frame while it
+    /// is handling a touch. A poll or a timer asking for one waited for the
+    /// next touch: every tap showed the frame before it, and nothing that
+    /// moves on its own (a meter, the tuner) moved.
+    pub fn frame_now(&mut self) {
+        #[cfg(target_os = "ios")]
+        if self.renderer.is_active() {
+            self.redraw();
+            return;
+        }
+        self.request_redraw();
     }
 
     pub fn request_redraw(&self) {
@@ -628,6 +645,15 @@ impl<Rend: WindowRenderer> View<Rend> {
 
         let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
         if !is_blocked && is_visible && (is_animating || forced) {
+            // iOS: from inside a frame, the next one has to come back
+            // through the event loop (`frame_now` draws at once), paced.
+            #[cfg(target_os = "ios")]
+            if self.pacing.min_frame.is_some() {
+                self.request_paced_redraw();
+            } else {
+                self.proxy.send_event(BlitzShellEvent::RequestRedraw { doc_id: self.doc.id() });
+            }
+            #[cfg(not(target_os = "ios"))]
             self.request_redraw();
         } else if !is_blocked && is_visible && self.doc.inner().widgets_need_redraw() {
             // FTS: a widget still moving (a face's spring settling, an LFO
