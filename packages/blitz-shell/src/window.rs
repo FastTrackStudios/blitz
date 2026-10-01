@@ -460,10 +460,23 @@ impl<Rend: WindowRenderer> View<Rend> {
             self.frame_now();
             return;
         }
+        self.send_timer_redraw(min - since);
+    }
+
+    /// FTS (iOS): the next frame of an animation, after the pace's wait
+    /// (at least a few ms) and always through the event loop.
+    #[cfg(target_os = "ios")]
+    fn request_timed_redraw(&mut self) {
+        let min = self.pacing.min_frame.unwrap_or(Duration::from_millis(16));
+        let since = self.pacing.last_frame.elapsed();
+        self.send_timer_redraw(min.saturating_sub(since).max(Duration::from_millis(4)));
+    }
+
+    /// A `RequestRedraw` sent after `wait` by the pacer thread; one at a time.
+    fn send_timer_redraw(&mut self, wait: Duration) {
         if self.pacing.pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        let wait = min - since;
         let doc_id = self.doc.id();
         let tx = self.pacing.timer.get_or_insert_with(|| {
             let (tx, rx) = std::sync::mpsc::channel::<(Duration, usize)>();
@@ -640,25 +653,30 @@ impl<Rend: WindowRenderer> View<Rend> {
         #[cfg(feature = "custom-widget")]
         if self.doc.inner().composite.unsettled.get() {
             self.paint_page = true;
+            #[cfg(target_os = "ios")]
+            self.request_timed_redraw();
+            #[cfg(not(target_os = "ios"))]
             self.request_paced_redraw();
         }
 
         let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
         if !is_blocked && is_visible && (is_animating || forced) {
-            // iOS: from inside a frame, the next one has to come back
-            // through the event loop (`frame_now` draws at once), paced.
+            // iOS: from inside a frame the next one comes back through the
+            // event loop, always after a wait (`frame_now` draws at once): a
+            // frame slower than the pace would otherwise draw the next inside
+            // itself, and the run loop — touches with it — never got a turn.
             #[cfg(target_os = "ios")]
-            if self.pacing.min_frame.is_some() {
-                self.request_paced_redraw();
-            } else {
-                self.proxy.send_event(BlitzShellEvent::RequestRedraw { doc_id: self.doc.id() });
-            }
+            self.request_timed_redraw();
             #[cfg(not(target_os = "ios"))]
             self.request_redraw();
         } else if !is_blocked && is_visible && self.doc.inner().widgets_need_redraw() {
             // FTS: a widget still moving (a face's spring settling, an LFO
             // lamp) asks for the next frame, at the paced rate. A still one
-            // doesn't, and the window sleeps.
+            // doesn't, and the window sleeps. (iOS: never inside this frame —
+            // see the branch above.)
+            #[cfg(target_os = "ios")]
+            self.request_timed_redraw();
+            #[cfg(not(target_os = "ios"))]
             self.request_paced_redraw();
         }
     }

@@ -67,6 +67,14 @@ impl Rasterizer {
     #[must_use]
     pub fn new(context: Box<dyn std::any::Any>) -> Option<Self> {
         let device_handle = *context.downcast::<DeviceHandle>().ok()?;
+        // FTS: Vello's compute stages need indirect execution (even in its
+        // CPU mode, for the raster pass). A device without it (the iOS
+        // simulator's Metal) gets no rasteriser, and the widget paints into
+        // the page — drawn by whatever renderer the window has.
+        let indirect = wgpu::DownlevelFlags::INDIRECT_EXECUTION;
+        if !device_handle.adapter.get_downlevel_capabilities().flags.contains(indirect) {
+            return None;
+        }
         let renderer = shared_renderer(&device_handle.device)?;
         Some(Self {
             device_handle,
