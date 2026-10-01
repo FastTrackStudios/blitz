@@ -1325,7 +1325,11 @@ impl BaseDocument {
     }
 
     pub fn snapshot_node(&mut self, node_id: usize) {
-        let node = &mut self.nodes[node_id];
+        // A node removed since its id was taken (a menu closed by the
+        // click that pressed it) has nothing to snapshot.
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
 
         // Do not snapshot nodes that have never been styled. A snapshot records an element's
         // pre-mutation state so a restyle can diff selector matches then-vs-now. An element
@@ -1395,6 +1399,12 @@ impl BaseDocument {
     }
 
     pub fn snapshot_node_and(&mut self, node_id: usize, cb: impl FnOnce(&mut Node)) {
+        // Gone, or detached and waiting to be dropped (its parent maybe
+        // already gone): nothing to restyle, and marking its ancestors
+        // would walk into freed ids.
+        if !self.nodes.get(node_id).is_some_and(|n| n.flags.is_in_document()) {
+            return;
+        }
         self.snapshot_node(node_id);
         cb(&mut self.nodes[node_id]);
     }
@@ -1425,6 +1435,15 @@ impl BaseDocument {
     }
     pub fn set_focus_to(&mut self, focus_node_id: usize) -> bool {
         if Some(focus_node_id) == self.focus_node_id {
+            return false;
+        }
+        // A press can land on a node the same press removes (a menu row
+        // that closes its menu): nothing to focus, and a focus left on
+        // it is stale.
+        if !self.nodes.contains(focus_node_id) {
+            if self.focus_node_id.is_some_and(|id| !self.nodes.contains(id)) {
+                self.focus_node_id = None;
+            }
             return false;
         }
 
@@ -1576,6 +1595,15 @@ impl BaseDocument {
             }
         }
         self.hovered_scrollbar = hovered_scrollbar;
+        // A hit test between a removal and the next layout can find a node
+        // that has just been removed (a menu closed under the pointer):
+        // that is hovering nothing, and a hover left on one is stale.
+        let live = |doc: &Self, id: usize| doc.nodes.get(id).is_some_and(|n| n.flags.is_in_document());
+        let hit = hit.filter(|hit| live(self, hit.node_id));
+        if self.hover_node_id.is_some_and(|id| !live(self, id)) {
+            self.hover_node_id = None;
+            self.hover_node_is_text = false;
+        }
         let hover_node_id = hit.map(|hit| hit.node_id);
         let new_is_text = hit.map(|hit| hit.is_text).unwrap_or(false);
 
@@ -1584,8 +1612,14 @@ impl BaseDocument {
             return scrollbar_changed;
         }
 
-        let old_node_path = self.maybe_node_layout_ancestors(self.hover_node_id);
-        let new_node_path = self.maybe_node_layout_ancestors(hover_node_id);
+        // Only what is still in the document: a node detached since the
+        // last layout (removed, not yet dropped) is not hovered or
+        // unhovered — restyling it walks up into a parent that is gone.
+        let in_document = |doc: &Self, path: Vec<usize>| -> Vec<usize> {
+            path.into_iter().filter(|&id| live(doc, id)).collect()
+        };
+        let old_node_path = in_document(self, self.maybe_node_layout_ancestors(self.hover_node_id));
+        let new_node_path = in_document(self, self.maybe_node_layout_ancestors(hover_node_id));
         let same_count = old_node_path
             .iter()
             .zip(&new_node_path)
@@ -1779,7 +1813,7 @@ impl BaseDocument {
     }
 
     pub fn get_cursor(&self) -> Option<CursorIcon> {
-        let node = &self.nodes[self.get_hover_node_id()?];
+        let node = self.nodes.get(self.get_hover_node_id()?)?;
 
         if let Some(subdoc) = node.subdoc().map(|doc| doc.inner()) {
             return subdoc.get_cursor();

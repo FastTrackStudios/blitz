@@ -1252,4 +1252,97 @@ mod test {
             "form node is enabled"
         );
     }
+
+    /// A press can land on a node the same press removes — a menu row
+    /// that closes its menu. Focus then moves on without touching the
+    /// removed node, and focusing a removed node is refused.
+    #[test]
+    fn focus_moves_on_from_a_removed_node() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let (row, other) = {
+            let mut mutator = document.mutate();
+            let row = mutator.create_element(qual_name!("button", html), vec![]);
+            let other = mutator.create_element(qual_name!("button", html), vec![]);
+            mutator.append_children(root, &[row, other]);
+            (row, other)
+        };
+        assert!(document.set_focus_to(row));
+        document.mutate().remove_and_drop_node(row);
+        assert!(document.set_focus_to(other), "focus moves on without the removed node");
+        assert!(!document.set_focus_to(row), "a removed node takes no focus");
+        assert_eq!(document.focus_node_id, Some(other));
+    }
+
+    /// Between a removal and the next layout, a node's layout parent can
+    /// already be gone — a menu that closed under the pointer. Walking up
+    /// from it (hover, measuring) ends there instead of panicking.
+    #[test]
+    fn a_layout_parent_removed_before_the_next_layout_ends_the_walk() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let (menu, row) = {
+            let mut mutator = document.mutate();
+            let menu = mutator.create_element(qual_name!("div", html), vec![]);
+            let row = mutator.create_element(qual_name!("div", html), vec![]);
+            mutator.append_children(root, &[menu, row]);
+            (menu, row)
+        };
+        // As the last layout left it: the row laid out inside the menu.
+        document.nodes[row].layout_parent.set(Some(menu));
+        document.mutate().remove_and_drop_node(menu);
+        assert_eq!(document.node_layout_ancestors(row), vec![row]);
+        let _ = document.get_client_bounding_rect(row);
+        let _ = document.set_hover_to(0.0, 0.0);
+    }
+
+    /// A hovered button detached from a menu that is then dropped (the
+    /// menu's close button): its parent id is stale. Moving the pointer
+    /// unhovers it without walking into the dropped menu.
+    #[test]
+    fn a_detached_hovered_node_whose_parent_is_gone_is_left_alone() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let (menu, close) = {
+            let mut mutator = document.mutate();
+            let menu = mutator.create_element(qual_name!("div", html), vec![]);
+            let close = mutator.create_element(qual_name!("button", html), vec![]);
+            mutator.append_children(root, &[menu]);
+            mutator.append_children(menu, &[close]);
+            (menu, close)
+        };
+        document.hover_node_id = Some(close);
+        {
+            let mut mutator = document.mutate();
+            mutator.remove_node(close);
+            mutator.remove_and_drop_node(menu);
+        }
+        // As a detached node can still carry it: the parent it had.
+        document.nodes[close].parent = Some(menu);
+        document.nodes[close].mark_ancestors_dirty();
+        let _ = document.set_hover_to(0.0, 0.0);
+        let _ = document.clear_hover();
+        assert_eq!(document.hover_node_id, None);
+    }
+
+    /// A click whose handler removed its own target (the close button of
+    /// the card it is on): the default action runs after, on nothing, and
+    /// must not look the stale id up.
+    #[test]
+    fn a_default_action_on_a_removed_target_does_nothing() {
+        let mut document = BaseDocument::new(DocumentConfig::default());
+        let root = document.root_node().id;
+        let close = {
+            let mut mutator = document.mutate();
+            let close = mutator.create_element(qual_name!("button", html), vec![]);
+            mutator.append_children(root, &[close]);
+            close
+        };
+        document.mutate().remove_and_drop_node(close);
+        let mut event = blitz_traits::events::DomEvent::new(
+            close,
+            blitz_traits::events::DomEventData::Focus(blitz_traits::events::BlitzFocusEvent),
+        );
+        crate::events::handle_dom_event(&mut document, &mut event, |_| {});
+    }
 }

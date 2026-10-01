@@ -36,9 +36,23 @@ use crate::accessibility::AccessibilityState;
 fn get_safe_area_insets(_window: &dyn Window) -> PhysicalInsets<u32> {
     Default::default()
 }
+/// The insets the page is laid out inside: the safe area, or — with
+/// `BLITZ_SAFE_AREA_SIDES=0` — only its top and bottom, the page drawn to
+/// the left and right edges and minding the sides itself (a phone on its
+/// side reports the camera housing's width on both sides, though only one
+/// side has it, and only mid-height).
 #[cfg(not(target_os = "macos"))]
 fn get_safe_area_insets(window: &dyn Window) -> PhysicalInsets<u32> {
-    window.safe_area()
+    static SIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let sides = *SIDES.get_or_init(|| {
+        std::env::var("BLITZ_SAFE_AREA_SIDES").map_or(true, |v| v != "0")
+    });
+    let mut insets = window.safe_area();
+    if !sides {
+        insets.left = 0;
+        insets.right = 0;
+    }
+    insets
 }
 
 pub struct WindowConfig<Rend: WindowRenderer> {
@@ -103,6 +117,12 @@ pub struct View<Rend: WindowRenderer> {
     paint_page: bool,
     pub is_visible: bool,
     pub safe_area_insets: PhysicalInsets<u32>,
+    /// Frames left to re-read the safe area after a resize: on iOS a
+    /// rotation resizes the surface before UIKit updates the insets, so
+    /// the insets read at the resize are the old orientation's (a phone on
+    /// its side kept its upright top and bottom bands). A few frames after
+    /// it, the new ones have landed.
+    inset_checks: u32,
 
     #[cfg(target_arch = "wasm32")]
     pending_resize: Option<winit::dpi::PhysicalSize<u32>>,
@@ -150,7 +170,6 @@ impl<Rend: WindowRenderer> View<Rend> {
         }
 
         // Create viewport
-        // TODO: account for the "safe area"
         let scale = winit_window.scale_factor() as f32;
         let mut size = winit_window.surface_size();
         if (size.width == 0 || size.height == 0)
@@ -176,7 +195,14 @@ impl<Rend: WindowRenderer> View<Rend> {
         let safe_area_insets = get_safe_area_insets(&*winit_window);
         let theme = winit_window.theme().unwrap_or(Theme::Light);
         let color_scheme = theme_to_color_scheme(theme);
-        let viewport = Viewport::new(size.width, size.height, scale, color_scheme);
+        // The viewport is the window surface minus the safe area insets
+        let viewport_width = size
+            .width
+            .saturating_sub(safe_area_insets.left + safe_area_insets.right);
+        let viewport_height = size
+            .height
+            .saturating_sub(safe_area_insets.top + safe_area_insets.bottom);
+        let viewport = Viewport::new(viewport_width, viewport_height, scale, color_scheme);
 
         // Create shell provider
         let shell_provider = BlitzShellProvider::new(winit_window.clone(), proxy.clone());
@@ -208,6 +234,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             buttons: MouseEventButtons::None,
             active_events: Arc::new(AtomicRefCell::new(Vec::new())),
             safe_area_insets,
+            inset_checks: 0,
             #[cfg(target_arch = "wasm32")]
             pending_resize: None,
             #[cfg(target_arch = "wasm32")]
@@ -294,6 +321,11 @@ impl<Rend: WindowRenderer> View<Rend> {
             inner.viewport().window_size
         };
 
+        // The render surface covers the entire window, including the safe area
+        let insets = self.safe_area_insets;
+        let width = width + insets.left + insets.right;
+        let height = height + insets.top + insets.bottom;
+
         let proxy = self.proxy.clone();
         self.renderer
             .resume(Arc::new(self.window.clone()), width, height, move || {
@@ -320,12 +352,21 @@ impl<Rend: WindowRenderer> View<Rend> {
         inner.resolve(animation_time);
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
-        let insets = self.safe_area_insets.to_logical(scale);
+        // The painter offsets the scene in physical pixels (it draws at
+        // `scale`), so the safe area goes in physical too, as it does
+        // everywhere else here. Logical put the picture a third of the way
+        // down a 3x phone's notch while input (`pointer_coords`) took off the
+        // whole inset: every tap landed below what it pressed.
+        let insets = self.safe_area_insets;
 
         #[cfg(feature = "custom-widget")]
         inner.can_create_surfaces(&mut self.renderer as _);
 
-        self.renderer.set_size(width, height);
+        // The render surface covers the entire window, including the safe area
+        self.renderer.set_size(
+            width + insets.left + insets.right,
+            height + insets.top + insets.bottom,
+        );
 
         self.renderer.render(|scene| {
             paint_scene(
@@ -449,6 +490,25 @@ impl<Rend: WindowRenderer> View<Rend> {
         }
     }
 
+    /// Read the safe area again, and when it has changed since the last
+    /// resize, lay the page out in the new one: every frame (it is a
+    /// field read), and for a few frames after a resize, asking for them.
+    fn recheck_safe_area(&mut self) {
+        let now = get_safe_area_insets(&*self.window);
+        if now != self.safe_area_insets {
+            self.safe_area_insets = now;
+            let size = self.window.surface_size();
+            let width = size.width.saturating_sub(now.left + now.right);
+            let height = size.height.saturating_sub(now.top + now.bottom);
+            self.with_viewport(|v| v.window_size = (width, height));
+            self.request_redraw();
+        }
+        if self.inset_checks > 0 {
+            self.inset_checks -= 1;
+            self.request_redraw();
+        }
+    }
+
     pub fn redraw(&mut self) {
         let frame_started = std::time::Instant::now();
         self.pacing.last_frame = frame_started;
@@ -471,9 +531,17 @@ impl<Rend: WindowRenderer> View<Rend> {
 
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
-        let is_animating = inner.is_animating();
         let is_blocked = inner.has_pending_critical_resources();
-        let insets = self.safe_area_insets.to_logical(scale);
+        // Whether anything animates going in, for painting only the layers
+        // (the redraw request below asks again, after painting).
+        #[cfg(feature = "custom-widget")]
+        let animating_before = inner.is_animating();
+        // The painter offsets the scene in physical pixels (it draws at
+        // `scale`), so the safe area goes in physical too, as it does
+        // everywhere else here. Logical put the picture a third of the way
+        // down a 3x phone's notch while input (`pointer_coords`) took off the
+        // whole inset: every tap landed below what it pressed.
+        let insets = self.safe_area_insets;
 
         if !is_blocked && is_visible {
             // FTS: paint and present, timed apart from `resolve`, which
@@ -487,7 +555,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             {
                 let layers_only = anyrender::composite::supported()
                     && !self.paint_page
-                    && !is_animating
+                    && !animating_before
                     && !inner.resolve_damaged()
                     && !inner.composite.unsettled.get()
                     && !inner.composite.placed.borrow().is_empty()
@@ -526,6 +594,10 @@ impl<Rend: WindowRenderer> View<Rend> {
             );
         }
 
+        // FTS: asked after painting, not before. A widget's paint clears
+        // its own "changed" and sets it again when it goes on moving (a
+        // fling, a playhead): asked before, the answer is the last frame's.
+        let is_animating = inner.is_animating();
         drop(inner);
 
         blitz_traits::LAST_FRAME_MICROS.store(
@@ -745,6 +817,7 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Currently handled at the level above in application.rs
             }
             WindowEvent::RedrawRequested => {
+                self.recheck_safe_area();
                 self.redraw();
             }
             WindowEvent::Moved(_) => {}
@@ -756,6 +829,9 @@ impl<Rend: WindowRenderer> View<Rend> {
             },
             WindowEvent::SurfaceResized(physical_size) => {
                 self.safe_area_insets = get_safe_area_insets(&*self.window);
+                // Half a second of frames to catch the insets UIKit sets
+                // after the resize (see `inset_checks`).
+                self.inset_checks = 30;
                 // On WASM, defer the apply: wgpu's surface.configure clears the canvas,
                 // so running it every frame flickers during a drag. The browser stretches
                 // the stale backing store until the debounce timer settles.
@@ -948,13 +1024,23 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Touch input doesn't emit a `PointerMoved` before the button
                 // event the way a mouse does, so synthesise a move to update the
                 // hover/hit position to the touch location.
+                //
+                // On a press, the move is the finger arriving, not dragging:
+                // it carries no held button. With the button already held,
+                // the document measured it from the *previous* press's
+                // position, took any tap somewhere new for a pan, and sent
+                // no click on release — every other tap was lost.
                 if id != BlitzPointerId::Mouse {
+                    let buttons = match state {
+                        ElementState::Pressed => self.buttons ^ button.into(),
+                        ElementState::Released => self.buttons,
+                    };
                     let event = BlitzPointerEvent {
                         id,
                         is_primary: primary,
                         coords,
                         button: Default::default(),
-                        buttons: self.buttons,
+                        buttons,
                         mods: winit_modifiers_to_kbt_modifiers(self.keyboard_modifiers.state()),
                         details: PointerDetails::default(),
                         element: Default::default(),
