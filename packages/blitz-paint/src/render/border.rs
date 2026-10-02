@@ -241,6 +241,15 @@ impl ElementCx<'_, '_> {
                 Edge::Bottom => (&border.border_bottom_color, border.border_bottom_style),
                 Edge::Left => (&border.border_left_color, border.border_left_style),
             };
+            // FTS: an edge with no width draws nothing. A preflight such as
+            // Tailwind's (`*{border:0 solid}`) gives every element four
+            // solid, zero-width, visible edges, and each became a
+            // degenerate fill per frame — and on a rounded box a corner
+            // arc from 0/0, a NaN path vello warns about and drops.
+            if self.edge_width(edge) <= 0.0 {
+                continue;
+            }
+
             let color = color.resolve_to_absolute(&current_color).as_srgb_color();
 
             if color.components[3] <= 0.0 {

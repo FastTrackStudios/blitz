@@ -20,6 +20,7 @@ use atomic_refcell::AtomicRefCell;
 use std::any::Any;
 use std::sync::Arc;
 use std::task::Waker;
+use std::time::Duration;
 use web_time::Instant;
 use winit::event::{ButtonSource, ElementState, MouseButton};
 use winit::event_loop::ActiveEventLoop;
@@ -35,9 +36,23 @@ use crate::accessibility::AccessibilityState;
 fn get_safe_area_insets(_window: &dyn Window) -> PhysicalInsets<u32> {
     Default::default()
 }
+/// The insets the page is laid out inside: the safe area, or — with
+/// `BLITZ_SAFE_AREA_SIDES=0` — only its top and bottom, the page drawn to
+/// the left and right edges and minding the sides itself (a phone on its
+/// side reports the camera housing's width on both sides, though only one
+/// side has it, and only mid-height).
 #[cfg(not(target_os = "macos"))]
 fn get_safe_area_insets(window: &dyn Window) -> PhysicalInsets<u32> {
-    window.safe_area()
+    static SIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let sides = *SIDES.get_or_init(|| {
+        std::env::var("BLITZ_SAFE_AREA_SIDES").map_or(true, |v| v != "0")
+    });
+    let mut insets = window.safe_area();
+    if !sides {
+        insets.left = 0;
+        insets.right = 0;
+    }
+    insets
 }
 
 pub struct WindowConfig<Rend: WindowRenderer> {
@@ -95,8 +110,19 @@ pub struct View<Rend: WindowRenderer> {
     /// avoid a reference cycle.
     pub active_events: Arc<AtomicRefCell<Vec<BlitzPointerEvent>>>,
     pub animation_timer: Option<Instant>,
+    /// FTS: redraw pacing for document updates (see `request_paced_redraw`).
+    pacing: Pacing,
+    /// FTS: the next frame must paint the page, not just its layers: the
+    /// DOM changed, or an event may have changed what the page shows.
+    paint_page: bool,
     pub is_visible: bool,
     pub safe_area_insets: PhysicalInsets<u32>,
+    /// Frames left to re-read the safe area after a resize: on iOS a
+    /// rotation resizes the surface before UIKit updates the insets, so
+    /// the insets read at the resize are the old orientation's (a phone on
+    /// its side kept its upright top and bottom bands). A few frames after
+    /// it, the new ones have landed.
+    inset_checks: u32,
 
     #[cfg(target_arch = "wasm32")]
     pending_resize: Option<winit::dpi::PhysicalSize<u32>>,
@@ -144,7 +170,6 @@ impl<Rend: WindowRenderer> View<Rend> {
         }
 
         // Create viewport
-        // TODO: account for the "safe area"
         let scale = winit_window.scale_factor() as f32;
         let mut size = winit_window.surface_size();
         if (size.width == 0 || size.height == 0)
@@ -170,7 +195,14 @@ impl<Rend: WindowRenderer> View<Rend> {
         let safe_area_insets = get_safe_area_insets(&*winit_window);
         let theme = winit_window.theme().unwrap_or(Theme::Light);
         let color_scheme = theme_to_color_scheme(theme);
-        let viewport = Viewport::new(size.width, size.height, scale, color_scheme);
+        // The viewport is the window surface minus the safe area insets
+        let viewport_width = size
+            .width
+            .saturating_sub(safe_area_insets.left + safe_area_insets.right);
+        let viewport_height = size
+            .height
+            .saturating_sub(safe_area_insets.top + safe_area_insets.bottom);
+        let viewport = Viewport::new(viewport_width, viewport_height, scale, color_scheme);
 
         // Create shell provider
         let shell_provider = BlitzShellProvider::new(winit_window.clone(), proxy.clone());
@@ -202,6 +234,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             buttons: MouseEventButtons::None,
             active_events: Arc::new(AtomicRefCell::new(Vec::new())),
             safe_area_insets,
+            inset_checks: 0,
             #[cfg(target_arch = "wasm32")]
             pending_resize: None,
             #[cfg(target_arch = "wasm32")]
@@ -209,6 +242,8 @@ impl<Rend: WindowRenderer> View<Rend> {
             #[cfg(target_arch = "wasm32")]
             resize_timer_scheduled: false,
             pointer_pos: Default::default(),
+            pacing: Pacing::from_env(),
+            paint_page: true,
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
             accessibility,
@@ -286,6 +321,11 @@ impl<Rend: WindowRenderer> View<Rend> {
             inner.viewport().window_size
         };
 
+        // The render surface covers the entire window, including the safe area
+        let insets = self.safe_area_insets;
+        let width = width + insets.left + insets.right;
+        let height = height + insets.top + insets.bottom;
+
         let proxy = self.proxy.clone();
         self.renderer
             .resume(Arc::new(self.window.clone()), width, height, move || {
@@ -312,12 +352,21 @@ impl<Rend: WindowRenderer> View<Rend> {
         inner.resolve(animation_time);
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
-        let insets = self.safe_area_insets.to_logical(scale);
+        // The painter offsets the scene in physical pixels (it draws at
+        // `scale`), so the safe area goes in physical too, as it does
+        // everywhere else here. Logical put the picture a third of the way
+        // down a 3x phone's notch while input (`pointer_coords`) took off the
+        // whole inset: every tap landed below what it pressed.
+        let insets = self.safe_area_insets;
 
         #[cfg(feature = "custom-widget")]
-        inner.can_create_surfaces(&self.renderer as _);
+        inner.can_create_surfaces(&mut self.renderer as _);
 
-        self.renderer.set_size(width, height);
+        // The render surface covers the entire window, including the safe area
+        self.renderer.set_size(
+            width + insets.left + insets.right,
+            height + insets.top + insets.bottom,
+        );
 
         self.renderer.render(|scene| {
             paint_scene(
@@ -344,23 +393,123 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 
     pub fn poll(&mut self) -> bool {
-        if let Some(waker) = &self.waker {
-            let cx = std::task::Context::from_waker(waker);
-            if self.doc.poll(Some(cx)) {
-                #[cfg(feature = "accessibility")]
-                {
-                    let inner = self.doc.inner();
-                    if inner.has_changes() {
-                        self.accessibility.update_tree(&inner);
-                    }
-                }
+        let Some(waker) = self.waker.clone() else {
+            return false;
+        };
+        // FTS: poll until the runtime is waiting again. A poll that finds
+        // work runs it and returns without leaving a waker behind; only a
+        // poll that comes back pending arms the next wake-up. Stopping after
+        // one worked only while every redraw's window event polled again
+        // (so the window never stopped redrawing); a window that goes quiet
+        // would never hear its timers. Bounded, and continued through the
+        // event loop, so a runtime that is always busy can't starve it.
+        let mut worked = false;
+        let mut rounds = 0;
+        loop {
+            let cx = std::task::Context::from_waker(&waker);
+            if !self.doc.poll(Some(cx)) {
+                break;
+            }
+            worked = true;
+            rounds += 1;
+            if rounds == 8 {
+                let window_id = self.window.id();
+                self.proxy.send_event(BlitzShellEvent::Poll { window_id });
+                break;
+            }
+        }
+        if !worked {
+            return false;
+        }
 
-                self.request_redraw();
-                return true;
+        #[cfg(feature = "accessibility")]
+        {
+            let inner = self.doc.inner();
+            if inner.has_changes() {
+                self.accessibility.update_tree(&inner);
             }
         }
 
-        false
+        // FTS: a poll is often just a timer or a stream waking the runtime
+        // and changing nothing; only a mutation or a widget with something
+        // new to draw is worth a frame.
+        let (mutated, widgets) = {
+            let mut inner = self.doc.inner_mut();
+            (inner.take_mutated(), inner.widgets_need_redraw())
+        };
+        self.paint_page |= mutated;
+        let wanted = mutated | widgets;
+        if wanted {
+            self.request_paced_redraw();
+        }
+        true
+    }
+
+    /// A redraw for a document update, paced to `FTS_MAX_FPS` (30 unless
+    /// set; 0 = unpaced). Clocks that each update the document at their own
+    /// rate (meters, visualisers, lamps) would otherwise interleave into a
+    /// redraw at every vsync, each one painting the whole window. Input
+    /// still redraws at once: it asks the window directly.
+    fn request_paced_redraw(&mut self) {
+        let Some(min) = self.pacing.min_frame else {
+            self.frame_now();
+            return;
+        };
+        let since = self.pacing.last_frame.elapsed();
+        if since >= min {
+            self.frame_now();
+            return;
+        }
+        self.send_timer_redraw(min - since);
+    }
+
+    /// FTS (iOS): the next frame of an animation, after the pace's wait
+    /// (at least a few ms) and always through the event loop.
+    #[cfg(target_os = "ios")]
+    fn request_timed_redraw(&mut self) {
+        let min = self.pacing.min_frame.unwrap_or(Duration::from_millis(16));
+        let since = self.pacing.last_frame.elapsed();
+        self.send_timer_redraw(min.saturating_sub(since).max(Duration::from_millis(4)));
+    }
+
+    /// A `RequestRedraw` sent after `wait` by the pacer thread; one at a time.
+    fn send_timer_redraw(&mut self, wait: Duration) {
+        if self.pacing.pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let doc_id = self.doc.id();
+        let tx = self.pacing.timer.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<(Duration, usize)>();
+            let proxy = self.proxy.clone();
+            std::thread::Builder::new()
+                .name("blitz-redraw-pacer".into())
+                .spawn(move || {
+                    while let Ok((wait, doc_id)) = rx.recv() {
+                        std::thread::sleep(wait);
+                        proxy.send_event(BlitzShellEvent::RequestRedraw { doc_id });
+                    }
+                })
+                .expect("spawn redraw pacer");
+            tx
+        });
+        let _ = tx.send((wait, doc_id));
+    }
+
+    /// FTS: a frame for a document update or a paced tick — drawn now on
+    /// iOS, asked for elsewhere. winit-uikit decides whether a view is
+    /// Metal-backed by asking if the *view* is a `CAMetalLayer`, which a
+    /// UIView never is, so every redraw it is asked for becomes
+    /// `setNeedsDisplay` — and UIKit only turns that into a frame while it
+    /// is handling a touch. A poll or a timer asking for one waited for the
+    /// next touch: every tap showed the frame before it, and nothing that
+    /// moves on its own (a meter, the tuner) moved.
+    pub fn frame_now(&mut self) {
+        #[cfg(target_os = "ios")]
+        if self.renderer.is_active() {
+            self.redraw();
+            return;
+        }
+        self.request_redraw();
     }
 
     pub fn request_redraw(&self) {
@@ -371,8 +520,31 @@ impl<Rend: WindowRenderer> View<Rend> {
         }
     }
 
+    /// Read the safe area again, and when it has changed since the last
+    /// resize, lay the page out in the new one: every frame (it is a
+    /// field read), and for a few frames after a resize, asking for them.
+    fn recheck_safe_area(&mut self) {
+        let now = get_safe_area_insets(&*self.window);
+        if now != self.safe_area_insets {
+            self.safe_area_insets = now;
+            let size = self.window.surface_size();
+            let width = size.width.saturating_sub(now.left + now.right);
+            let height = size.height.saturating_sub(now.top + now.bottom);
+            self.with_viewport(|v| v.window_size = (width, height));
+            self.request_redraw();
+        }
+        if self.inset_checks > 0 {
+            self.inset_checks -= 1;
+            self.request_redraw();
+        }
+    }
+
     pub fn redraw(&mut self) {
         let frame_started = std::time::Instant::now();
+        self.pacing.last_frame = frame_started;
+        self.pacing
+            .pending
+            .store(false, std::sync::atomic::Ordering::Release);
         #[cfg(target_os = "ios")]
         self.ios_request_redraw.set(false);
         let animation_time = self.current_animation_time();
@@ -389,9 +561,17 @@ impl<Rend: WindowRenderer> View<Rend> {
 
         let (width, height) = inner.viewport().window_size;
         let scale = inner.viewport().scale_f64();
-        let is_animating = inner.is_animating();
         let is_blocked = inner.has_pending_critical_resources();
-        let insets = self.safe_area_insets.to_logical(scale);
+        // Whether anything animates going in, for painting only the layers
+        // (the redraw request below asks again, after painting).
+        #[cfg(feature = "custom-widget")]
+        let animating_before = inner.is_animating();
+        // The painter offsets the scene in physical pixels (it draws at
+        // `scale`), so the safe area goes in physical too, as it does
+        // everywhere else here. Logical put the picture a third of the way
+        // down a 3x phone's notch while input (`pointer_coords`) took off the
+        // whole inset: every tap landed below what it pressed.
+        let insets = self.safe_area_insets;
 
         if !is_blocked && is_visible {
             // FTS: paint and present, timed apart from `resolve`, which
@@ -399,6 +579,23 @@ impl<Rend: WindowRenderer> View<Rend> {
             // number and a slow frame says nothing about which half.
             let started = std::time::Instant::now();
             let mut encoded = std::time::Duration::ZERO;
+            // FTS: nothing changed but widgets drawn as layers: paint just
+            // those, and let the renderer put them over the page it kept.
+            #[cfg(feature = "custom-widget")]
+            {
+                let layers_only = anyrender::composite::supported()
+                    && !self.paint_page
+                    && !animating_before
+                    && !inner.resolve_damaged()
+                    && !inner.composite.unsettled.get()
+                    && !inner.composite.placed.borrow().is_empty()
+                    && !inner.page_widgets_need_redraw();
+                let reuse = layers_only
+                    && blitz_paint::paint_composited_widgets(&mut inner, &mut self.renderer, scale);
+                let layers = if reuse { inner.composite.layers.borrow().clone() } else { Vec::new() };
+                anyrender::composite::begin(reuse, layers);
+            }
+            self.paint_page = false;
             self.renderer.render(|scene| {
                 let at = std::time::Instant::now();
                 paint_scene(
@@ -427,21 +624,60 @@ impl<Rend: WindowRenderer> View<Rend> {
             );
         }
 
+        // FTS: asked after painting, not before. A widget's paint clears
+        // its own "changed" and sets it again when it goes on moving (a
+        // fling, a playhead): asked before, the answer is the last frame's.
+        let is_animating = inner.is_animating();
         drop(inner);
 
         blitz_traits::LAST_FRAME_MICROS.store(
             u64::try_from(frame_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             core::sync::atomic::Ordering::Relaxed,
         );
+        #[cfg(feature = "custom-widget")]
+        let (layers_only, layers) = (
+            anyrender::composite::reused(),
+            self.doc.inner().composite.placed.borrow().len(),
+        );
+        #[cfg(not(feature = "custom-widget"))]
+        let (layers_only, layers) = (false, 0);
+        self.pacing.log_frame(frame_started.elapsed(), layers_only, layers);
 
         // FTS: `FTS_FORCE_REDRAW=1` keeps asking for the next frame
         // whether or not the document thinks it is animating, which is
         // what makes a window measurable: a render loop that runs at the
         // machine's own pace, rather than one that only advances when
         // somebody moves a mouse over it.
+        // FTS: the last paint changed which widgets are layers: once more,
+        // so they are drawn as the new set says.
+        #[cfg(feature = "custom-widget")]
+        if self.doc.inner().composite.unsettled.get() {
+            self.paint_page = true;
+            #[cfg(target_os = "ios")]
+            self.request_timed_redraw();
+            #[cfg(not(target_os = "ios"))]
+            self.request_paced_redraw();
+        }
+
         let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
         if !is_blocked && is_visible && (is_animating || forced) {
+            // iOS: from inside a frame the next one comes back through the
+            // event loop, always after a wait (`frame_now` draws at once): a
+            // frame slower than the pace would otherwise draw the next inside
+            // itself, and the run loop — touches with it — never got a turn.
+            #[cfg(target_os = "ios")]
+            self.request_timed_redraw();
+            #[cfg(not(target_os = "ios"))]
             self.request_redraw();
+        } else if !is_blocked && is_visible && self.doc.inner().widgets_need_redraw() {
+            // FTS: a widget still moving (a face's spring settling, an LFO
+            // lamp) asks for the next frame, at the paced rate. A still one
+            // doesn't, and the window sleeps. (iOS: never inside this frame —
+            // see the branch above.)
+            #[cfg(target_os = "ios")]
+            self.request_timed_redraw();
+            #[cfg(not(target_os = "ios"))]
+            self.request_paced_redraw();
         }
     }
 
@@ -594,6 +830,30 @@ impl<Rend: WindowRenderer> View<Rend> {
         self.accessibility
             .process_window_event(&*self.window, &event);
 
+        // FTS: an event may change what the page shows without the DOM
+        // changing (a selection, a scroll, a focus ring): paint the page.
+        // Moving the pointer with no button held only restyles (hover),
+        // which `resolve` sees; dragging over a layer (a face's knob) only
+        // changes the layer.
+        match &event {
+            WindowEvent::RedrawRequested | WindowEvent::Moved(_) | WindowEvent::ActivationTokenDone { .. } => {}
+            WindowEvent::PointerMoved { .. } => {
+                if self.buttons != MouseEventButtons::None {
+                    #[cfg(feature = "custom-widget")]
+                    let over_layer = {
+                        let inner = self.doc.inner();
+                        inner
+                            .hovered_node_id()
+                            .is_some_and(|id| inner.composite.placed.borrow().contains_key(&id))
+                    };
+                    #[cfg(not(feature = "custom-widget"))]
+                    let over_layer = false;
+                    self.paint_page |= !over_layer;
+                }
+            }
+            _ => self.paint_page = true,
+        }
+
         match event {
             WindowEvent::Destroyed => {}
             WindowEvent::ActivationTokenDone { .. } => {},
@@ -601,6 +861,7 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Currently handled at the level above in application.rs
             }
             WindowEvent::RedrawRequested => {
+                self.recheck_safe_area();
                 self.redraw();
             }
             WindowEvent::Moved(_) => {}
@@ -612,6 +873,9 @@ impl<Rend: WindowRenderer> View<Rend> {
             },
             WindowEvent::SurfaceResized(physical_size) => {
                 self.safe_area_insets = get_safe_area_insets(&*self.window);
+                // Half a second of frames to catch the insets UIKit sets
+                // after the resize (see `inset_checks`).
+                self.inset_checks = 30;
                 // On WASM, defer the apply: wgpu's surface.configure clears the canvas,
                 // so running it every frame flickers during a drag. The browser stretches
                 // the stale backing store until the debounce timer settles.
@@ -804,13 +1068,23 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Touch input doesn't emit a `PointerMoved` before the button
                 // event the way a mouse does, so synthesise a move to update the
                 // hover/hit position to the touch location.
+                //
+                // On a press, the move is the finger arriving, not dragging:
+                // it carries no held button. With the button already held,
+                // the document measured it from the *previous* press's
+                // position, took any tap somewhere new for a pan, and sent
+                // no click on release — every other tap was lost.
                 if id != BlitzPointerId::Mouse {
+                    let buttons = match state {
+                        ElementState::Pressed => self.buttons ^ button.into(),
+                        ElementState::Released => self.buttons,
+                    };
                     let event = BlitzPointerEvent {
                         id,
                         is_primary: primary,
                         coords,
                         button: Default::default(),
-                        buttons: self.buttons,
+                        buttons,
                         mods: winit_modifiers_to_kbt_modifiers(self.keyboard_modifiers.state()),
                         details: PointerDetails::default(),
                         element: Default::default(),
@@ -859,6 +1133,79 @@ impl<Rend: WindowRenderer> View<Rend> {
             WindowEvent::DragMoved { .. } => {},
             WindowEvent::DragDropped { .. } => {},
             WindowEvent::DragLeft { .. } => {},
+        }
+    }
+}
+
+/// FTS: when the window last drew, and the one deferred redraw queued for
+/// a document update that came too soon after it.
+struct Pacing {
+    min_frame: Option<Duration>,
+    last_frame: Instant,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    timer: Option<std::sync::mpsc::Sender<(Duration, usize)>>,
+    /// `FTS_FPS_LOG=1`: frames and their mean and worst cost, each second.
+    log: Option<FrameLog>,
+}
+
+struct FrameLog {
+    since: Instant,
+    frames: u32,
+    /// Frames that only drew layers over the kept page.
+    layers_only: u32,
+    layers: usize,
+    busy: Duration,
+    worst: Duration,
+}
+
+impl Pacing {
+    fn from_env() -> Self {
+        let fps = std::env::var("FTS_MAX_FPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(30);
+        // No threads to pace with in a browser; it paces itself.
+        let fps = if cfg!(target_arch = "wasm32") { 0 } else { fps };
+        Self {
+            min_frame: (fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(fps))),
+            last_frame: Instant::now(),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timer: None,
+            log: std::env::var_os("FTS_FPS_LOG").map(|_| FrameLog {
+                since: Instant::now(),
+                frames: 0,
+                layers_only: 0,
+                layers: 0,
+                busy: Duration::ZERO,
+                worst: Duration::ZERO,
+            }),
+        }
+    }
+
+    fn log_frame(&mut self, took: Duration, layers_only: bool, layers: usize) {
+        let Some(log) = self.log.as_mut() else { return };
+        log.frames += 1;
+        log.layers_only += u32::from(layers_only);
+        log.layers = layers;
+        log.busy += took;
+        log.worst = log.worst.max(took);
+        if log.since.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "fps {:>3} ({:>3} layers only, {} layers)  frame {:>5.2} ms mean  {:>5.2} ms worst",
+                log.frames,
+                log.layers_only,
+                log.layers,
+                log.busy.as_secs_f64() * 1000.0 / f64::from(log.frames.max(1)),
+                log.worst.as_secs_f64() * 1000.0,
+            );
+            *log = FrameLog {
+                since: Instant::now(),
+                frames: 0,
+                layers_only: 0,
+                layers: 0,
+                busy: Duration::ZERO,
+                worst: Duration::ZERO,
+            };
         }
     }
 }

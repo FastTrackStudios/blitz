@@ -65,6 +65,10 @@ pub struct BlitzDomPainter<'dom, 'a> {
 
     // Pre-computed `Scene`s for each CustomWidget
     pub(crate) custom_widget_scenes: &'a CustomWidgetSceneMap,
+
+    /// FTS: texture widgets drawn as layers (root document only).
+    #[cfg(feature = "custom-widget")]
+    pub(crate) compositing: Option<&'a crate::composite::Compositing>,
 }
 
 impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
@@ -102,6 +106,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             layer_manager,
             selection_ranges,
             custom_widget_scenes,
+            #[cfg(feature = "custom-widget")]
+            compositing: None,
         }
     }
 
@@ -154,9 +160,22 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         if let Some(bg_color) = background_color {
             let bg_color = bg_color.as_srgb_color();
+            // The canvas is the whole surface, the safe area's insets
+            // included: the page's background runs under a phone's status
+            // bar and home indicator rather than leaving them the
+            // renderer's clear colour (white, in light mode). The insets
+            // arrive in physical pixels already (see blitz-shell), so they
+            // are not scaled again. The trailing insets are not known here
+            // (a phone on its side has a bottom inset and no top one), so
+            // the fill overshoots by a margin wider than any inset; the
+            // surface clips it.
+            const OVERSHOOT: f64 = 1024.0;
             let rect = Rect::from_origin_size(
-                (self.initial_x * self.scale, self.initial_y * self.scale),
-                (bg_width as f64, bg_height as f64),
+                (0.0, 0.0),
+                (
+                    bg_width as f64 + self.initial_x + OVERSHOOT,
+                    bg_height as f64 + self.initial_y + OVERSHOOT,
+                ),
             );
             scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
         }
@@ -306,6 +325,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             return;
         }
 
+        // FTS: content painting over a composited layer is lifted into an
+        // overlay above it, so the layer can be drawn under it.
+        #[cfg(feature = "custom-widget")]
+        if let Some(compositing) = self.compositing {
+            let bbox = screen_bbox.intersect(clip_rect);
+            if compositing.lifts(node, &styles, bbox) {
+                compositing.lift(node, clip_rect, bbox, |overlay| {
+                    self.render_element(overlay, node_id, parent_style_transform, clip_rect);
+                });
+                return;
+            }
+        }
+
         // Optimise zero-area (/very small area) clips by not rendering at all
         let clip_area = content_box_size.width * content_box_size.height;
         let overflow_area = node.scrollable_overflow.width() * node.scrollable_overflow.height();
@@ -439,7 +471,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 #[cfg(feature = "svg")]
                                 cx.draw_svg(scene);
                                 #[cfg(feature = "custom-widget")]
-                                cx.draw_custom_widget(scene);
+                                cx.draw_custom_widget(scene, child_clip_rect);
                                 cx.draw_sub_document(scene);
                                 cx.draw_input(scene);
                                 cx.draw_text_input_text(scene, content_position);
@@ -1014,13 +1046,26 @@ impl ElementCx<'_, '_> {
     }
 
     #[cfg(feature = "custom-widget")]
-    fn draw_custom_widget(&self, scene: &mut impl PaintScene) {
+    fn draw_custom_widget(&self, scene: &mut impl PaintScene, clip: Rect) {
         if let Some(key) = self.custom_widget_scene
             && let Some(widget_scene) = self.custom_widget_scenes.borrow_mut().remove(&key)
         {
             let x = self.frame.content_box.origin().x;
             let y = self.frame.content_box.origin().y;
             let transform = self.transform.then_translate(Vec2 { x, y });
+
+            // FTS: a layer instead, drawn over the page from its texture.
+            // The same box `process_custom_widget_node` painted it for.
+            if let Some(compositing) = self.context.compositing {
+                let size = self.node.final_layout.size;
+                let size = (
+                    f64::from((f64::from(size.width) * self.scale) as u32),
+                    f64::from((f64::from(size.height) * self.scale) as u32),
+                );
+                if compositing.place(self.node, transform, size, clip) {
+                    return;
+                }
+            }
 
             // FTS: moved, not cloned. `append_scene` takes the scene by
             // value and the map is this frame's alone, so removing is

@@ -290,6 +290,20 @@ pub struct BaseDocument {
     /// Nodes that contain custom widgets
     #[cfg(feature = "custom-widget")]
     pub(crate) custom_widget_nodes: HashSet<usize>,
+    /// FTS: the custom widget a press landed on, holding the pointer until
+    /// it is released: a knob dragged off its face keeps turning, and
+    /// hears the release wherever it happens.
+    #[cfg(feature = "custom-widget")]
+    pub(crate) pointer_capture: Option<usize>,
+    /// FTS: the DOM was mutated since [`Self::take_mutated`] last asked.
+    pub(crate) mutated: bool,
+    /// FTS: the last `resolve` found damage: restyled, relaid out or
+    /// repainted nodes, so the page must be painted again.
+    pub(crate) resolve_damaged: bool,
+    /// FTS: which custom widgets are drawn as composited layers (see
+    /// [`CompositeState`]). The painter keeps it; the shell reads it.
+    #[cfg(feature = "custom-widget")]
+    pub composite: CompositeState,
     /// Rendering resources allocated by custom widgets that should be deallocated during the next render
     #[cfg(feature = "custom-widget")]
     pub(crate) pending_resource_deallocations: Vec<anyrender::ResourceId>,
@@ -456,6 +470,12 @@ impl BaseDocument {
 
             #[cfg(feature = "custom-widget")]
             custom_widget_nodes: HashSet::new(),
+            #[cfg(feature = "custom-widget")]
+            pointer_capture: None,
+            mutated: false,
+            resolve_damaged: true,
+            #[cfg(feature = "custom-widget")]
+            composite: CompositeState::default(),
             #[cfg(feature = "custom-widget")]
             pending_resource_deallocations: Vec::new(),
 
@@ -868,6 +888,61 @@ impl BaseDocument {
     }
 
     /// Whether the document has been mutated
+    /// FTS: whether the DOM was mutated since the last call. A host polls
+    /// its UI runtime for many reasons (a timer, a stream) that change
+    /// nothing; only a mutation — or a widget with something new to draw
+    /// ([`Self::widgets_need_redraw`]) — is worth a frame.
+    pub fn take_mutated(&mut self) -> bool {
+        std::mem::take(&mut self.mutated)
+    }
+
+    /// FTS: the node under the pointer, if any.
+    pub fn hovered_node_id(&self) -> Option<usize> {
+        self.hover_node_id
+    }
+
+    /// FTS: whether the last [`Self::resolve`] found anything to restyle,
+    /// lay out or repaint.
+    pub fn resolve_damaged(&self) -> bool {
+        self.resolve_damaged
+    }
+
+    /// FTS: whether any custom widget has something new to draw (its
+    /// [`Widget::needs_redraw`](crate::Widget::needs_redraw)): a value
+    /// set on it, or a picture that is moving.
+    #[cfg(feature = "custom-widget")]
+    pub fn widgets_need_redraw(&self) -> bool {
+        self.custom_widget_nodes.iter().any(|&id| {
+            self.nodes
+                .get(id)
+                .and_then(|n| n.element_data())
+                .and_then(|el| el.custom_widget_data())
+                .is_some_and(|w| w.widget.needs_redraw())
+        })
+    }
+
+    #[cfg(not(feature = "custom-widget"))]
+    pub fn widgets_need_redraw(&self) -> bool {
+        false
+    }
+
+    /// FTS: whether a widget that is *not* drawn as a layer needs a redraw
+    /// (so the page must be painted, not just its layers).
+    #[cfg(feature = "custom-widget")]
+    pub fn page_widgets_need_redraw(&self) -> bool {
+        let layers = self.composite.placed.borrow();
+        let visible = self.composite.visible.borrow();
+        // A texture widget that wasn't drawn (culled) changes nothing seen.
+        let seen = |id: &usize| visible.contains(id) || !self.composite.widgets.borrow().contains(id);
+        self.custom_widget_nodes.iter().filter(|id| !layers.contains_key(id) && seen(id)).any(|&id| {
+            self.nodes
+                .get(id)
+                .and_then(|n| n.element_data())
+                .and_then(|el| el.custom_widget_data())
+                .is_some_and(|w| w.widget.needs_redraw())
+        })
+    }
+
     pub fn has_changes(&self) -> bool {
         self.changed_nodes.is_empty()
     }
@@ -1250,7 +1325,11 @@ impl BaseDocument {
     }
 
     pub fn snapshot_node(&mut self, node_id: usize) {
-        let node = &mut self.nodes[node_id];
+        // A node removed since its id was taken (a menu closed by the
+        // click that pressed it) has nothing to snapshot.
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
 
         // Do not snapshot nodes that have never been styled. A snapshot records an element's
         // pre-mutation state so a restyle can diff selector matches then-vs-now. An element
@@ -1320,6 +1399,12 @@ impl BaseDocument {
     }
 
     pub fn snapshot_node_and(&mut self, node_id: usize, cb: impl FnOnce(&mut Node)) {
+        // Gone, or detached and waiting to be dropped (its parent maybe
+        // already gone): nothing to restyle, and marking its ancestors
+        // would walk into freed ids.
+        if !self.nodes.get(node_id).is_some_and(|n| n.flags.is_in_document()) {
+            return;
+        }
         self.snapshot_node(node_id);
         cb(&mut self.nodes[node_id]);
     }
@@ -1350,6 +1435,15 @@ impl BaseDocument {
     }
     pub fn set_focus_to(&mut self, focus_node_id: usize) -> bool {
         if Some(focus_node_id) == self.focus_node_id {
+            return false;
+        }
+        // A press can land on a node the same press removes (a menu row
+        // that closes its menu): nothing to focus, and a focus left on
+        // it is stale.
+        if !self.nodes.contains(focus_node_id) {
+            if self.focus_node_id.is_some_and(|id| !self.nodes.contains(id)) {
+                self.focus_node_id = None;
+            }
             return false;
         }
 
@@ -1501,6 +1595,15 @@ impl BaseDocument {
             }
         }
         self.hovered_scrollbar = hovered_scrollbar;
+        // A hit test between a removal and the next layout can find a node
+        // that has just been removed (a menu closed under the pointer):
+        // that is hovering nothing, and a hover left on one is stale.
+        let live = |doc: &Self, id: usize| doc.nodes.get(id).is_some_and(|n| n.flags.is_in_document());
+        let hit = hit.filter(|hit| live(self, hit.node_id));
+        if self.hover_node_id.is_some_and(|id| !live(self, id)) {
+            self.hover_node_id = None;
+            self.hover_node_is_text = false;
+        }
         let hover_node_id = hit.map(|hit| hit.node_id);
         let new_is_text = hit.map(|hit| hit.is_text).unwrap_or(false);
 
@@ -1509,8 +1612,14 @@ impl BaseDocument {
             return scrollbar_changed;
         }
 
-        let old_node_path = self.maybe_node_layout_ancestors(self.hover_node_id);
-        let new_node_path = self.maybe_node_layout_ancestors(hover_node_id);
+        // Only what is still in the document: a node detached since the
+        // last layout (removed, not yet dropped) is not hovered or
+        // unhovered — restyling it walks up into a parent that is gone.
+        let in_document = |doc: &Self, path: Vec<usize>| -> Vec<usize> {
+            path.into_iter().filter(|&id| live(doc, id)).collect()
+        };
+        let old_node_path = in_document(self, self.maybe_node_layout_ancestors(self.hover_node_id));
+        let new_node_path = in_document(self, self.maybe_node_layout_ancestors(hover_node_id));
         let same_count = old_node_path
             .iter()
             .zip(&new_node_path)
@@ -1652,15 +1761,14 @@ impl BaseDocument {
     }
 
     pub fn is_animating(&self) -> bool {
-        #[cfg(feature = "custom-widget")]
-        let has_custom_widgets = !self.custom_widget_nodes.is_empty();
-        #[cfg(not(feature = "custom-widget"))]
-        let has_custom_widgets = false;
-
+        // FTS: a custom widget does not keep the window animating. A
+        // widget with something new to draw asks for it (its component
+        // schedules an update, which redraws); one standing still costs
+        // nothing, where before every mounted widget redrew the whole
+        // window at vsync.
         self.has_canvas
             | self.has_active_animations
             | self.subdoc_is_animating
-            | has_custom_widgets
             | (self.scroll_animation != ScrollAnimationState::None)
             | self.scrollbars_animating()
     }
@@ -1705,7 +1813,7 @@ impl BaseDocument {
     }
 
     pub fn get_cursor(&self) -> Option<CursorIcon> {
-        let node = &self.nodes[self.get_hover_node_id()?];
+        let node = self.nodes.get(self.get_hover_node_id()?)?;
 
         if let Some(subdoc) = node.subdoc().map(|doc| doc.inner()) {
             return subdoc.get_cursor();
@@ -2465,4 +2573,29 @@ mod font_face_override_tests {
              not the font file's internal `name` table entry",
         );
     }
+}
+
+/// FTS: the custom widgets drawn as composited layers, carried from one
+/// painted frame to the next.
+///
+/// Whether a widget can be a layer is only known once the page is painted
+/// (is anything painted over it?), so each paint composites the widgets the
+/// previous paint found free and records which are free now. When the two
+/// differ the set is *unsettled* and the next frame paints again.
+#[cfg(feature = "custom-widget")]
+#[derive(Default)]
+pub struct CompositeState {
+    /// Widget nodes to composite (found free by the last paint).
+    pub widgets: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// The layers the last paint drew, in order: what a frame that reuses
+    /// the page draws over it.
+    pub layers: std::cell::RefCell<Vec<anyrender::composite::Layer>>,
+    /// The widgets the last paint drew as layers, and their textures: all
+    /// a frame that reuses the page repaints.
+    pub placed: std::cell::RefCell<std::collections::HashMap<usize, anyrender::ResourceId>>,
+    /// The texture widgets the last paint drew at all (not culled): only
+    /// these being redrawn changes what the page shows.
+    pub visible: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// The last paint changed `widgets`: paint once more.
+    pub unsettled: std::cell::Cell<bool>,
 }

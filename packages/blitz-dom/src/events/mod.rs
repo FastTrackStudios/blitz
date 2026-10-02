@@ -99,7 +99,17 @@ pub(crate) fn handle_dom_event<F: FnMut(DomEvent)>(
     mut dispatch_event: F,
 ) {
     let target_node_id = event.target;
-    let node = &mut doc.nodes[target_node_id];
+    // A handler for this very event can remove its target (a button that
+    // closes the card it is on): the default action then has nothing to
+    // act on — and every path below walks from the target, so a live
+    // target is all they need.
+    let Some(node) = doc
+        .nodes
+        .get_mut(target_node_id)
+        .filter(|node| node.flags.is_in_document())
+    else {
+        return;
+    };
     let pos = node.absolute_position(0.0, 0.0);
 
     // Whether this event can move the caret/selection (or change the text) of a text input,

@@ -23,7 +23,7 @@ members = [
     "examples/wgpu_texture",
     "examples/wasm_hello",
 ]
-exclude = ["sites"]
+exclude = ["sites", "vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -296,3 +296,10 @@ tracing-subscriber = "0.3"
 # [patch."https://github.com/linebender/parley"]
 # parley = { path = "../parley/parley" }
 # fontique = { path = "../parley/fontique" }
+
+# FTS: the renderer seam and vello window renderer, vendored for layered
+# compositing (see vendor/anyrender/src/composite.rs). Consumers patch the
+# same paths.
+[patch.crates-io]
+anyrender = { path = "vendor/anyrender" }
+anyrender_vello = { path = "vendor/anyrender_vello" }

@@ -32,7 +32,10 @@ use crate::{
             ConstructionTaskResultData, LayoutChildren, build_inline_layout_into,
             collect_layout_children,
         },
-        damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
+        damage::{
+            ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC, LAYOUT_UNCHANGED,
+            ONLY_RELAYOUT,
+        },
     },
     node::TextBrush,
 };
@@ -78,37 +81,88 @@ impl BaseDocument {
         self.resolve_stylist(current_time_for_animations);
         timer.record_time("style");
 
-        // Propagate damage flags (from mutation and restyles) up and down the tree
-        if self.incremental_layout {
+        // FTS: frames with nothing to lay out skip layout.
+        //
+        // - Idle: nothing mutated or restyled. Skip every tree walk and
+        //   just paint. A host with custom widgets repaints on their
+        //   schedule, and each of those frames used to lay the whole
+        //   document out again.
+        // - Paint-only: a colour, a shadow, a transform. Styles are
+        //   resolved and painting reads them directly; only overflow and
+        //   transforms need their pass. Stylo counts some of these (a
+        //   box-shadow) as relayout; `compute_layout_damage` marks the
+        //   ones whose layout styles are all unchanged, and the relayout
+        //   bit comes off them here.
+        //
+        // BLITZ_NO_IDLE_SKIP=1 turns both off.
+        let skip_allowed =
+            self.incremental_layout && std::env::var_os("BLITZ_NO_IDLE_SKIP").is_none();
+        let paint_only = RestyleDamage::REPAINT
+            | RestyleDamage::REBUILD_STACKING_CONTEXT
+            | RestyleDamage::RECALCULATE_OVERFLOW;
+        let mut any_damage = false;
+        let mut needs_layout = false;
+        for (_, node) in self.nodes.iter_mut() {
+            let Some(mut damage) = node.damage() else {
+                continue;
+            };
+            if damage.contains(LAYOUT_UNCHANGED) {
+                if !damage.intersects(CONSTRUCT_BOX | CONSTRUCT_FC | CONSTRUCT_DESCENDENT) {
+                    damage.remove(ONLY_RELAYOUT);
+                }
+                damage.remove(LAYOUT_UNCHANGED);
+                node.set_damage(damage);
+            }
+            any_damage |= !damage.is_empty();
+            needs_layout |= !(damage - paint_only).is_empty();
+        }
+        self.resolve_damaged = !skip_allowed || any_damage;
+        if skip_allowed && !any_damage {
+            for (_, node) in self.nodes.iter_mut() {
+                node.unset_dirty_descendants();
+            }
+        } else if skip_allowed && !needs_layout {
             self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
             timer.record_time("damage");
-        }
-
-        // Fix up tree for layout (insert anonymous blocks as necessary, etc)
-        self.resolve_layout_children();
-        timer.record_time("construct");
-
-        self.resolve_deferred_tasks();
-        timer.record_time("pconstruct");
-
-        // Merge stylo into taffy
-        self.flush_styles_to_layout(root_node_id);
-        timer.record_time("flush");
-
-        // Next we resolve layout with the data resolved by stlist
-        self.resolve_layout();
-        timer.record_time("layout");
-
-        self.resolve_transforms(root_node_id);
-        timer.record_time("transform");
-
-        // Clear all damage and dirty flags
-        if self.incremental_layout {
+            self.resolve_transforms(root_node_id);
+            timer.record_time("transform");
             for (_, node) in self.nodes.iter_mut() {
                 node.clear_damage_mut();
                 node.unset_dirty_descendants();
             }
-            timer.record_time("c_damage");
+        } else {
+            // Propagate damage flags (from mutation and restyles) up and down the tree
+            if self.incremental_layout {
+                self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
+                timer.record_time("damage");
+            }
+
+            // Fix up tree for layout (insert anonymous blocks as necessary, etc)
+            self.resolve_layout_children();
+            timer.record_time("construct");
+
+            self.resolve_deferred_tasks();
+            timer.record_time("pconstruct");
+
+            // Merge stylo into taffy
+            self.flush_styles_to_layout(root_node_id);
+            timer.record_time("flush");
+
+            // Next we resolve layout with the data resolved by stlist
+            self.resolve_layout();
+            timer.record_time("layout");
+
+            self.resolve_transforms(root_node_id);
+            timer.record_time("transform");
+
+            // Clear all damage and dirty flags
+            if self.incremental_layout {
+                for (_, node) in self.nodes.iter_mut() {
+                    node.clear_damage_mut();
+                    node.unset_dirty_descendants();
+                }
+                timer.record_time("c_damage");
+            }
         }
 
         let mut subdoc_is_animating = false;

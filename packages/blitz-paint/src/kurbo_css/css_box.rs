@@ -614,6 +614,16 @@ impl BuildBezpath for BezPath {
 
 /// Get the start angle of the arc based on the border width and the radii
 fn start_angle(bt_width: f64, br_width: f64, radii: Vec2) -> f64 {
+    // FTS: an edge with no width. The split goes to the corner of the one
+    // that has width (an edge that meets nothing takes the whole arc), and
+    // halfway when neither has: without these, 0/0 and ∞/∞ below made the
+    // angle NaN, and the path with it.
+    match (bt_width <= 0.0, br_width <= 0.0) {
+        (true, true) => return std::f64::consts::FRAC_PI_4,
+        (true, false) => return std::f64::consts::FRAC_PI_2,
+        (false, true) => return 0.0,
+        (false, false) => {}
+    }
     // slope of the border intersection split
     let w = bt_width / br_width;
     let x = radii.y / (w * radii.x);
@@ -762,6 +772,16 @@ mod tests {
     fn handles_k_equal_two() {
         // k = radii.y / (w * radii.x) = 40 / ((10/40) * 80) = 2.0
         assert_solves(10.0, 40.0, Vec2 { x: 80.0, y: 40.0 });
+    }
+
+    #[test]
+    fn an_edge_with_no_width_gives_an_angle_not_nan() {
+        let radii = Vec2 { x: 8.0, y: 8.0 };
+        for (bt, br) in [(0.0, 0.0), (0.0, 3.0), (3.0, 0.0)] {
+            let t = start_angle(bt, br, radii);
+            assert!(t.is_finite(), "({bt}, {br}) gave {t}");
+            assert!((0.0..=std::f64::consts::FRAC_PI_2).contains(&t));
+        }
     }
 
     #[test]
