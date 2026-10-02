@@ -44,13 +44,24 @@ fn get_safe_area_insets(_window: &dyn Window) -> PhysicalInsets<u32> {
 /// - `BLITZ_SAFE_AREA_BOTTOM=0`: drawn to the bottom edge, under the home
 ///   indicator (a bar whose background should reach the edge, its controls
 ///   kept clear by the page).
+/// - `BLITZ_SAFE_AREA=0`: none of it — the page is the whole window and
+///   minds what it needs to itself. (On a phone the view's safe area can
+///   also be wrong: an app that rotated at launch kept portrait's insets
+///   on a landscape window.)
 #[cfg(not(target_os = "macos"))]
 fn get_safe_area_insets(window: &dyn Window) -> PhysicalInsets<u32> {
-    static KEEP: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-    let (sides, bottom) = *KEEP.get_or_init(|| {
+    static KEEP: std::sync::OnceLock<(bool, bool, bool)> = std::sync::OnceLock::new();
+    let (any, sides, bottom) = *KEEP.get_or_init(|| {
         let keep = |var: &str| std::env::var(var).map_or(true, |v| v != "0");
-        (keep("BLITZ_SAFE_AREA_SIDES"), keep("BLITZ_SAFE_AREA_BOTTOM"))
+        (
+            keep("BLITZ_SAFE_AREA"),
+            keep("BLITZ_SAFE_AREA_SIDES"),
+            keep("BLITZ_SAFE_AREA_BOTTOM"),
+        )
     });
+    if !any {
+        return PhysicalInsets::default();
+    }
     let mut insets = window.safe_area();
     if !sides {
         insets.left = 0;
