@@ -36,21 +36,39 @@ use crate::accessibility::AccessibilityState;
 fn get_safe_area_insets(_window: &dyn Window) -> PhysicalInsets<u32> {
     Default::default()
 }
-/// The insets the page is laid out inside: the safe area, or — with
-/// `BLITZ_SAFE_AREA_SIDES=0` — only its top and bottom, the page drawn to
-/// the left and right edges and minding the sides itself (a phone on its
-/// side reports the camera housing's width on both sides, though only one
-/// side has it, and only mid-height).
+/// The insets the page is laid out inside: the safe area, less what the
+/// page minds itself:
+/// - `BLITZ_SAFE_AREA_SIDES=0`: the page drawn to the left and right edges
+///   (a phone on its side reports the camera housing's width on both sides,
+///   though only one side has it, and only mid-height).
+/// - `BLITZ_SAFE_AREA_BOTTOM=0`: drawn to the bottom edge, under the home
+///   indicator (a bar whose background should reach the edge, its controls
+///   kept clear by the page).
+/// - `BLITZ_SAFE_AREA=0`: none of it — the page is the whole window and
+///   minds what it needs to itself. (On a phone the view's safe area can
+///   also be wrong: an app that rotated at launch kept portrait's insets
+///   on a landscape window.)
 #[cfg(not(target_os = "macos"))]
 fn get_safe_area_insets(window: &dyn Window) -> PhysicalInsets<u32> {
-    static SIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let sides = *SIDES.get_or_init(|| {
-        std::env::var("BLITZ_SAFE_AREA_SIDES").map_or(true, |v| v != "0")
+    static KEEP: std::sync::OnceLock<(bool, bool, bool)> = std::sync::OnceLock::new();
+    let (any, sides, bottom) = *KEEP.get_or_init(|| {
+        let keep = |var: &str| std::env::var(var).map_or(true, |v| v != "0");
+        (
+            keep("BLITZ_SAFE_AREA"),
+            keep("BLITZ_SAFE_AREA_SIDES"),
+            keep("BLITZ_SAFE_AREA_BOTTOM"),
+        )
     });
+    if !any {
+        return PhysicalInsets::default();
+    }
     let mut insets = window.safe_area();
     if !sides {
         insets.left = 0;
         insets.right = 0;
+    }
+    if !bottom {
+        insets.bottom = 0;
     }
     insets
 }
@@ -531,15 +549,29 @@ impl<Rend: WindowRenderer> View<Rend> {
             let width = size.width.saturating_sub(now.left + now.right);
             let height = size.height.saturating_sub(now.top + now.bottom);
             self.with_viewport(|v| v.window_size = (width, height));
-            self.request_redraw();
+            self.next_frame();
         }
         if self.inset_checks > 0 {
             self.inset_checks -= 1;
-            self.request_redraw();
+            self.next_frame();
         }
     }
 
+    /// Another frame after this one: on iOS through the pacer (a request to
+    /// winit outside a touch is never drawn), elsewhere asked of the window.
+    fn next_frame(&mut self) {
+        #[cfg(target_os = "ios")]
+        self.request_timed_redraw();
+        #[cfg(not(target_os = "ios"))]
+        self.request_redraw();
+    }
+
     pub fn redraw(&mut self) {
+        // Every frame, however it was asked for: on iOS most are drawn
+        // directly (`frame_now`), not through `RedrawRequested`, and a phone
+        // that rotated kept the insets it launched with — portrait's notch
+        // and home-indicator bands over a landscape page.
+        self.recheck_safe_area();
         let frame_started = std::time::Instant::now();
         self.pacing.last_frame = frame_started;
         self.pacing
@@ -861,7 +893,6 @@ impl<Rend: WindowRenderer> View<Rend> {
                 // Currently handled at the level above in application.rs
             }
             WindowEvent::RedrawRequested => {
-                self.recheck_safe_area();
                 self.redraw();
             }
             WindowEvent::Moved(_) => {}
