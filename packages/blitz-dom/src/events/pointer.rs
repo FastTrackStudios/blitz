@@ -152,6 +152,9 @@ impl PanState {
     }
 }
 
+/// How far (CSS px) a finger may move before its touch is a pan, not a tap.
+const TOUCH_TAP_SLOP: f32 = 10.0;
+
 pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
     doc: &mut BaseDocument,
     target: usize,
@@ -164,11 +167,19 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
 
     let mut changed = doc.set_hover_to(x, y);
 
-    // Check if we've moved enough to be considered a selection drag (2px threshold)
+    // Check if we've moved enough to be considered a drag: 2px for a mouse
+    // or pen (a selection), but a finger gets a tap's slop first. A fingertip
+    // rolls a few pixels on glass during an ordinary tap, and past the
+    // threshold the touch becomes a pan, which swallows the click — so at
+    // 2px taps on a phone died silently. 10px is about what UIKit allows.
     if buttons != MouseEventButtons::None && doc.drag_mode == DragMode::None {
         let dx = x - doc.mousedown_position.x;
         let dy = y - doc.mousedown_position.y;
-        if dx.abs() > 2.0 || dy.abs() > 2.0 {
+        let slop = match event.id {
+            BlitzPointerId::Finger(_) => TOUCH_TAP_SLOP,
+            BlitzPointerId::Mouse | BlitzPointerId::Pen => 2.0,
+        };
+        if dx.abs() > slop || dy.abs() > slop {
             match event.id {
                 BlitzPointerId::Mouse | BlitzPointerId::Pen => {
                     // `mousedown_node_id` is remembered from a previous
