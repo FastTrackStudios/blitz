@@ -499,6 +499,12 @@ impl<Rend: WindowRenderer> View<Rend> {
     fn request_timed_redraw(&mut self) {
         let min = self.pacing.min_frame.unwrap_or(Duration::from_millis(16));
         let wait = self.pacing.wait_for_next(min, Duration::from_millis(4));
+        // An animation's next frame (a face's lamps, a spring) waits at
+        // least as long as the last frame took: animating, the main thread
+        // is at most half busy, whatever a frame costs — three amp faces
+        // moving at 30 fps on a slow renderer left touches no turn at all.
+        let since_end = self.pacing.last_frame.elapsed().saturating_sub(self.pacing.last_cost);
+        let wait = wait.max(self.pacing.last_cost.saturating_sub(since_end));
         self.send_timer_redraw(wait);
     }
 
