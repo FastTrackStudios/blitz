@@ -14,6 +14,9 @@ mod event;
 mod net;
 mod window;
 
+/// FTS: frame counters any thread can read (a frozen screen says so).
+pub mod frame_stats;
+
 #[cfg(feature = "accessibility")]
 mod accessibility;
 

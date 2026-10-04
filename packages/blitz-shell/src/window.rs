@@ -411,6 +411,18 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 
     pub fn poll(&mut self) -> bool {
+        // FTS: timed, and marked as the main thread being busy, like a
+        // frame: building a page (opening its faces) happens here, and a
+        // slow one froze the screen without showing in the frame times.
+        let started = Instant::now();
+        crate::frame_stats::frame_began();
+        let polled = self.poll_inner();
+        crate::frame_stats::frame_ended();
+        crate::frame_stats::update_took(started.elapsed().as_micros() as u64);
+        polled
+    }
+
+    fn poll_inner(&mut self) -> bool {
         let Some(waker) = self.waker.clone() else {
             return false;
         };
@@ -573,6 +585,7 @@ impl<Rend: WindowRenderer> View<Rend> {
         // and home-indicator bands over a landscape page.
         self.recheck_safe_area();
         let frame_started = std::time::Instant::now();
+        crate::frame_stats::frame_began();
         self.pacing.last_frame = frame_started;
         self.pacing
             .pending
@@ -674,6 +687,7 @@ impl<Rend: WindowRenderer> View<Rend> {
         #[cfg(not(feature = "custom-widget"))]
         let (layers_only, layers) = (false, 0);
         self.pacing.last_cost = frame_started.elapsed();
+        crate::frame_stats::frame_ended();
         self.pacing.log_frame(self.pacing.last_cost, layers_only, layers);
 
         // FTS: `FTS_FORCE_REDRAW=1` keeps asking for the next frame
@@ -685,6 +699,7 @@ impl<Rend: WindowRenderer> View<Rend> {
         // so they are drawn as the new set says.
         #[cfg(feature = "custom-widget")]
         if self.doc.inner().composite.unsettled.get() {
+            crate::frame_stats::asked_again(crate::frame_stats::Why::Unsettled);
             self.paint_page = true;
             #[cfg(target_os = "ios")]
             self.request_timed_redraw();
@@ -694,6 +709,7 @@ impl<Rend: WindowRenderer> View<Rend> {
 
         let forced = std::env::var_os("FTS_FORCE_REDRAW").is_some();
         if !is_blocked && is_visible && (is_animating || forced) {
+            crate::frame_stats::asked_again(crate::frame_stats::Why::Animating);
             // iOS: from inside a frame the next one comes back through the
             // event loop, always after a wait (`frame_now` draws at once): a
             // frame slower than the pace would otherwise draw the next inside
@@ -703,6 +719,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             #[cfg(not(target_os = "ios"))]
             self.request_redraw();
         } else if !is_blocked && is_visible && self.doc.inner().widgets_need_redraw() {
+            crate::frame_stats::asked_again(crate::frame_stats::Why::Widgets);
             // FTS: a widget still moving (a face's spring settling, an LFO
             // lamp) asks for the next frame, at the paced rate. A still one
             // doesn't, and the window sleeps. (iOS: never inside this frame —
@@ -1225,7 +1242,8 @@ impl Pacing {
             last_cost: Duration::ZERO,
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             timer: None,
-            log: std::env::var_os("FTS_FPS_LOG").map(|_| FrameLog {
+            // Always kept (it feeds `frame_stats`); printed with FTS_FPS_LOG.
+            log: Some(FrameLog {
                 since: Instant::now(),
                 frames: 0,
                 layers_only: 0,
@@ -1243,7 +1261,17 @@ impl Pacing {
         log.layers = layers;
         log.busy += took;
         log.worst = log.worst.max(took);
-        if log.since.elapsed() >= Duration::from_secs(1) {
+        if log.since.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let mean_us = log.busy.as_micros() as u64 / u64::from(log.frames.max(1));
+        crate::frame_stats::publish(
+            log.frames,
+            u32::try_from(mean_us).unwrap_or(u32::MAX),
+            u32::try_from(log.worst.as_micros()).unwrap_or(u32::MAX),
+            u32::try_from(log.layers).unwrap_or(u32::MAX),
+        );
+        if std::env::var_os("FTS_FPS_LOG").is_some() {
             eprintln!(
                 "fps {:>3} ({:>3} layers only, {} layers)  frame {:>5.2} ms mean  {:>5.2} ms worst",
                 log.frames,
@@ -1252,14 +1280,14 @@ impl Pacing {
                 log.busy.as_secs_f64() * 1000.0 / f64::from(log.frames.max(1)),
                 log.worst.as_secs_f64() * 1000.0,
             );
-            *log = FrameLog {
-                since: Instant::now(),
-                frames: 0,
-                layers_only: 0,
-                layers: 0,
-                busy: Duration::ZERO,
-                worst: Duration::ZERO,
-            };
         }
+        *log = FrameLog {
+            since: Instant::now(),
+            frames: 0,
+            layers_only: 0,
+            layers: 0,
+            busy: Duration::ZERO,
+            worst: Duration::ZERO,
+        };
     }
 }
