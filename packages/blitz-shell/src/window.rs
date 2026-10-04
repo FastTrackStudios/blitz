@@ -473,12 +473,12 @@ impl<Rend: WindowRenderer> View<Rend> {
             self.frame_now();
             return;
         };
-        let since = self.pacing.last_frame.elapsed();
-        if since >= min {
+        let wait = self.pacing.wait_for_next(min, Duration::ZERO);
+        if wait.is_zero() {
             self.frame_now();
             return;
         }
-        self.send_timer_redraw(min - since);
+        self.send_timer_redraw(wait);
     }
 
     /// FTS (iOS): the next frame of an animation, after the pace's wait
@@ -486,8 +486,8 @@ impl<Rend: WindowRenderer> View<Rend> {
     #[cfg(target_os = "ios")]
     fn request_timed_redraw(&mut self) {
         let min = self.pacing.min_frame.unwrap_or(Duration::from_millis(16));
-        let since = self.pacing.last_frame.elapsed();
-        self.send_timer_redraw(min.saturating_sub(since).max(Duration::from_millis(4)));
+        let wait = self.pacing.wait_for_next(min, Duration::from_millis(4));
+        self.send_timer_redraw(wait);
     }
 
     /// A `RequestRedraw` sent after `wait` by the pacer thread; one at a time.
@@ -673,7 +673,8 @@ impl<Rend: WindowRenderer> View<Rend> {
         );
         #[cfg(not(feature = "custom-widget"))]
         let (layers_only, layers) = (false, 0);
-        self.pacing.log_frame(frame_started.elapsed(), layers_only, layers);
+        self.pacing.last_cost = frame_started.elapsed();
+        self.pacing.log_frame(self.pacing.last_cost, layers_only, layers);
 
         // FTS: `FTS_FORCE_REDRAW=1` keeps asking for the next frame
         // whether or not the document thinks it is animating, which is
@@ -1173,6 +1174,8 @@ impl<Rend: WindowRenderer> View<Rend> {
 struct Pacing {
     min_frame: Option<Duration>,
     last_frame: Instant,
+    /// How long the last frame took to draw, start to end.
+    last_cost: Duration,
     pending: Arc<std::sync::atomic::AtomicBool>,
     timer: Option<std::sync::mpsc::Sender<(Duration, usize)>>,
     /// `FTS_FPS_LOG=1`: frames and their mean and worst cost, each second.
@@ -1190,6 +1193,25 @@ struct FrameLog {
 }
 
 impl Pacing {
+    /// How long to wait before the next frame: the pace (`min` from the last
+    /// frame's start), and — on iOS, where frames are drawn on the main
+    /// thread inside event handling — an idle stretch after the last frame
+    /// ended, half its cost and at least 8 ms. A frame slower than the pace
+    /// otherwise drew the next straight after it, and touches (the rail, a
+    /// tab) waited for the frames to stop: the screen looked frozen while a
+    /// meter moved. `floor`: the least wait in any case.
+    fn wait_for_next(&self, min: Duration, floor: Duration) -> Duration {
+        let since = self.last_frame.elapsed();
+        let pace = min.saturating_sub(since);
+        #[cfg(target_os = "ios")]
+        let pace = {
+            let idle = (self.last_cost / 2).max(Duration::from_millis(8));
+            let since_end = since.saturating_sub(self.last_cost);
+            pace.max(idle.saturating_sub(since_end))
+        };
+        pace.max(floor)
+    }
+
     fn from_env() -> Self {
         let fps = std::env::var("FTS_MAX_FPS")
             .ok()
@@ -1200,6 +1222,7 @@ impl Pacing {
         Self {
             min_frame: (fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(fps))),
             last_frame: Instant::now(),
+            last_cost: Duration::ZERO,
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             timer: None,
             log: std::env::var_os("FTS_FPS_LOG").map(|_| FrameLog {
