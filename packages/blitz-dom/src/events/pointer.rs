@@ -62,6 +62,10 @@ pub(crate) enum DragMode {
     Panning(PanState),
     /// We are currently dragging a scrollbar thumb
     ScrollbarDrag(ScrollbarDragState),
+    /// FTS: a finger drag the pressed element took for itself (its
+    /// `pointerdown` was default-prevented — a knob, a fader): it pans
+    /// nothing, and its release is not a click.
+    Owned,
 }
 
 impl DragMode {
@@ -267,6 +271,9 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
                             }
                         }
                     }
+                }
+                BlitzPointerId::Finger(_) if doc.press_owned => {
+                    doc.drag_mode = DragMode::Owned;
                 }
                 BlitzPointerId::Finger(_) => {
                     let (allow_x, allow_y) = touch_action_pan_axes(doc, target);
@@ -641,9 +648,17 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
         }
     }
 
-    // Dispatch a click event
+    // Dispatch a click event — FTS: to what the press and the release
+    // share (their nearest common ancestor), as browsers do. Sent to the
+    // release's node, a press on one control let go over another (a knob
+    // dragged down across a footswitch) clicked the one it ended on. A press
+    // whose node has since gone falls back to the release's.
     if do_click && event.button == MouseEventButton::Main {
-        dispatch_event(DomEvent::new(target, DomEventData::Click(event.clone())));
+        let click_target = doc
+            .mousedown_node_id
+            .filter(|id| doc.nodes.get(*id).is_some())
+            .map_or(target, |down| common_ancestor(doc, down, target));
+        dispatch_event(DomEvent::new(click_target, DomEventData::Click(event.clone())));
     }
 
     // Dispatch a context menu event
@@ -653,6 +668,26 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
             DomEventData::ContextMenu(event.clone()),
         ));
     }
+}
+
+/// The nearest node that is `a` or an ancestor of it and also `b` or an
+/// ancestor of `b`; the root when they share nothing nearer.
+fn common_ancestor(doc: &BaseDocument, a: NodeId, b: NodeId) -> NodeId {
+    let parent = |id: NodeId| doc.nodes.get(id).and_then(|n| n.parent);
+    let mut ours = Vec::new();
+    let mut at = Some(a);
+    while let Some(id) = at {
+        ours.push(id);
+        at = parent(id);
+    }
+    let mut at = Some(b);
+    while let Some(id) = at {
+        if ours.contains(&id) {
+            return id;
+        }
+        at = parent(id);
+    }
+    doc.root_element().id
 }
 
 pub(crate) fn handle_click(
