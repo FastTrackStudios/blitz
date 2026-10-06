@@ -365,14 +365,56 @@ impl HoistedPaintChildren {
             let node = &doc.nodes[child.node_id];
             let left = child.position.x + node.final_layout.location.x;
             let top = child.position.y + node.final_layout.location.y;
-            let right = left + node.final_layout.size.width;
-            let bottom = top + node.final_layout.size.height;
+            let size = node.final_layout.size;
+
+            // The child's own box, and — FTS — what it hoists in turn: a
+            // dropdown hung from a z-indexed bar inside a z-indexed header.
+            // Without it a hit test pruned this context at its children's
+            // own boxes, and every press on the dropdown went to whatever
+            // lay beneath it.
+            let mut local = taffy::Rect {
+                left: 0.0,
+                top: 0.0,
+                right: size.width,
+                bottom: size.height,
+            };
+            if let Some(inner) = &node.stacking_context {
+                let area = inner.content_area;
+                if area.right > area.left && area.bottom > area.top {
+                    local.left = local.left.min(area.left);
+                    local.top = local.top.min(area.top);
+                    local.right = local.right.max(area.right);
+                    local.bottom = local.bottom.max(area.bottom);
+                }
+            }
+            // FTS: where the child is drawn, transform and all (a panel
+            // centred with `translateX(-50%)`). Painted and hit-tested
+            // through its transform, but reached through this untransformed
+            // area, half of such a panel took no presses.
+            if let Some(t) = node.transform {
+                let s = doc.viewport.scale_f64();
+                let corners = [
+                    (local.left, local.top),
+                    (local.right, local.top),
+                    (local.left, local.bottom),
+                    (local.right, local.bottom),
+                ]
+                .map(|(x, y)| t * kurbo::Point::new(f64::from(x) * s, f64::from(y) * s));
+                let xs = corners.map(|p| (p.x / s) as f32);
+                let ys = corners.map(|p| (p.y / s) as f32);
+                local = taffy::Rect {
+                    left: xs.iter().copied().fold(f32::INFINITY, f32::min),
+                    top: ys.iter().copied().fold(f32::INFINITY, f32::min),
+                    right: xs.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                    bottom: ys.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                };
+            }
 
             taffy::Rect {
-                top,
-                left,
-                bottom,
-                right,
+                left: left + local.left,
+                top: top + local.top,
+                right: left + local.right,
+                bottom: top + local.bottom,
             }
         }
 

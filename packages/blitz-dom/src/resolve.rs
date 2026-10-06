@@ -125,6 +125,7 @@ impl BaseDocument {
             self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
             timer.record_time("damage");
             self.resolve_transforms(root_node_id);
+            self.refresh_hoisted_positions();
             timer.record_time("transform");
             for (_, node) in self.nodes.iter_mut() {
                 node.clear_damage_mut();
@@ -153,6 +154,7 @@ impl BaseDocument {
             timer.record_time("layout");
 
             self.resolve_transforms(root_node_id);
+            self.refresh_hoisted_positions();
             timer.record_time("transform");
 
             // Clear all damage and dirty flags
@@ -447,5 +449,60 @@ impl BaseDocument {
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
+    }
+
+    /// FTS: every hoisted child's offset from its stacking-context root, from
+    /// the layout (and transforms) just made. They are collected while styles are flushed —
+    /// before layout — so the offsets baked in then were the previous
+    /// layout's: a layout that moved a layer without restyling it (an
+    /// iPhone's safe-area insets settling after launch) drew and hit-tested
+    /// the layer where it had been — on a 6.3" phone the macro bar 51pt from
+    /// where its knobs took a finger — until something restyled it.
+    fn refresh_hoisted_positions(&mut self) {
+        // Deepest first: a context's reach takes in the contexts it hoists.
+        let depth = |doc: &Self, id: usize| {
+            let mut n = 0usize;
+            let mut at = doc.nodes.get(id).and_then(|n| n.layout_parent.get());
+            while let Some(p) = at {
+                n += 1;
+                at = doc.nodes.get(p).and_then(|n| n.layout_parent.get());
+            }
+            n
+        };
+        let mut roots: Vec<(usize, usize)> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.stacking_context.is_some())
+            .map(|(id, _)| (depth(self, id), id))
+            .collect();
+        roots.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let roots: Vec<usize> = roots.into_iter().map(|(_, id)| id).collect();
+        for root in roots {
+            let Some(mut context) = self.nodes[root].stacking_context.take() else {
+                continue;
+            };
+            for hoisted in context.children.iter_mut() {
+                let mut position = taffy::Point::ZERO;
+                let mut at = self.nodes.get(hoisted.node_id).and_then(|n| n.layout_parent.get());
+                let mut reached = false;
+                while let Some(id) = at {
+                    if id == root {
+                        reached = true;
+                        break;
+                    }
+                    let Some(node) = self.nodes.get(id) else { break };
+                    position.x += node.final_layout.location.x - node.scroll_offset.x as f32;
+                    position.y += node.final_layout.location.y - node.scroll_offset.y as f32;
+                    at = node.layout_parent.get();
+                }
+                // Not under its root any more (a tree mid-change): the next
+                // flush rebuilds it; keep what it had.
+                if reached {
+                    hoisted.position = position;
+                }
+            }
+            context.compute_content_size(self);
+            self.nodes[root].stacking_context = Some(context);
+        }
     }
 }

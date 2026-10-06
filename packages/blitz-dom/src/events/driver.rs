@@ -232,13 +232,16 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                 );
             }
             UiEvent::PointerDown(data) => {
-                self.handle_pointer_event(
+                let cancelled = self.handle_pointer_event(
                     target,
                     data,
                     DomEventData::PointerDown,
                     Some(DomEventData::MouseDown),
                     DomEventData::TouchStart,
                 );
+                // FTS: a press its element default-prevented is its own to
+                // drag — no panning under a knob being turned.
+                self.doc.inner_mut().press_owned = cancelled;
             }
             UiEvent::PointerCancel(data) => {
                 // `pointercancel` has no mouse-compatibility event, but does
@@ -294,7 +297,7 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
         make_ptr_data: impl FnOnce(BlitzPointerEvent) -> DomEventData,
         make_mouse_data: Option<impl FnOnce(BlitzPointerEvent) -> DomEventData>,
         make_touch_data: impl FnOnce(BlitzPointerEvent) -> DomEventData,
-    ) {
+    ) -> bool {
         let mut ptr_event = DomEvent::new(target, make_ptr_data(data.clone()));
         let mut event_state = EventState::default();
         event_state = self.run_handler_event(&mut ptr_event, event_state);
@@ -318,10 +321,12 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             }
         }
 
-        if !event_state.is_cancelled() {
+        let cancelled = event_state.is_cancelled();
+        if !cancelled {
             self.run_default_action(&mut ptr_event);
         }
         self.process_queue();
+        cancelled
     }
 
     fn process_queue(&mut self) {

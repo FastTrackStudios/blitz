@@ -240,6 +240,9 @@ pub struct BaseDocument {
     pub(crate) active_node_id: Option<usize>,
     /// The node which recieved a mousedown event (if any)
     pub(crate) mousedown_node_id: Option<usize>,
+    /// FTS: the press under way was default-prevented at its `pointerdown`:
+    /// the element owns its drag (see `DragMode::Owned`).
+    pub(crate) press_owned: bool,
     /// The last time a mousedown was made (for double-click detection)
     pub(crate) last_mousedown_time: Option<Instant>,
     /// The position where mousedown occurred (for selection drags and double-click detection)
@@ -463,6 +466,7 @@ impl BaseDocument {
             focus_node_id: None,
             active_node_id: None,
             mousedown_node_id: None,
+            press_owned: false,
             has_active_animations: false,
             subdoc_is_animating: false,
             has_canvas: false,
