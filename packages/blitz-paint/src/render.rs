@@ -1109,16 +1109,34 @@ impl ElementCx<'_, '_> {
                 };
             }
 
-            // Render text
+            // Render text — or, while it is empty, the placeholder, faded
+            // (FTS: its own colour at 45%, through the brush override).
             let mut draw_text_context = self.context.draw_text_context.borrow_mut();
+            let placeholder = input_data
+                .placeholder
+                .as_ref()
+                .filter(|_| input_data.editor.raw_text().is_empty());
+            let (lines, brush_override) = match placeholder {
+                Some(placeholder) => (
+                    placeholder.lines(),
+                    Some(
+                        self.style
+                            .get_inherited_text()
+                            .color
+                            .as_srgb_color()
+                            .multiply_alpha(0.45),
+                    ),
+                ),
+                None => (input_data.editor.try_layout().unwrap().lines(), None),
+            };
             crate::text::stroke_text(
                 scene,
-                input_data.editor.try_layout().unwrap().lines(),
+                lines,
                 self.context.dom,
                 transform,
                 TextPaintOptions {
                     scale: self.scale,
-                    brush_override: None,
+                    brush_override,
                 },
                 self.node.id,
                 &mut draw_text_context,

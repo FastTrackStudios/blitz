@@ -890,6 +890,10 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         }
     }
 
+    let placeholder = element
+        .attr(local_name!("placeholder"))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
     let SpecialElementData::TextInput(text_input_data) = &mut element.special_data else {
         unreachable!();
     };
@@ -917,10 +921,27 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         parley_style.white_space_collapse,
     ));
     styles.insert(StyleProperty::Brush(parley_style.brush));
+    // FTS: the placeholder takes the same styles (below). Cloned here:
+    // `edit_styles` after the layout is refreshed would dirty it again.
+    let style_set = styles.clone();
     editor.set_alignment(alignment);
     editor.set_base_direction(base_direction);
 
     editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
+
+    // The placeholder, laid out the same way (its own small editor's layout,
+    // with the input's own text styles).
+    text_input_data.placeholder = placeholder.map(|text| {
+        let mut ed = parley::PlainEditor::new(parley_style.font_size);
+        ed.set_scale(doc.viewport.scale_f64() as f32);
+        ed.set_width(None);
+        *ed.edit_styles() = style_set;
+        ed.set_alignment(alignment);
+        ed.set_base_direction(base_direction);
+        ed.set_text(&text);
+        let mut font_ctx = doc.font_ctx.lock().unwrap();
+        ed.layout(&mut font_ctx, &mut doc.layout_ctx).clone()
+    });
 }
 
 fn create_checkbox_input(doc: &mut BaseDocument, input_element_id: NodeId) {
