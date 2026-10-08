@@ -764,6 +764,10 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
         element.special_data = SpecialElementData::TextInput(text_input_data);
     }
 
+    let placeholder = element
+        .attr(local_name!("placeholder"))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
     let SpecialElementData::TextInput(text_input_data) = &mut element.special_data else {
         unreachable!();
     };
@@ -779,6 +783,20 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multil
     styles.insert(StyleProperty::Brush(parley_style.brush));
 
     editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
+
+    // The placeholder, laid out the same way (its own small editor's layout).
+    text_input_data.placeholder = placeholder.map(|text| {
+        let mut ed = parley::PlainEditor::new(parley_style.font_size);
+        ed.set_scale(doc.viewport.scale_f64() as f32);
+        ed.set_width(None);
+        let styles = ed.edit_styles();
+        styles.insert(StyleProperty::FontSize(parley_style.font_size));
+        styles.insert(StyleProperty::LineHeight(parley_style.line_height));
+        styles.insert(StyleProperty::Brush(parley_style.brush));
+        ed.set_text(&text);
+        let mut font_ctx = doc.font_ctx.lock().unwrap();
+        ed.layout(&mut font_ctx, &mut doc.layout_ctx).clone()
+    });
 }
 
 fn create_checkbox_input(doc: &mut BaseDocument, input_element_id: usize) {

@@ -837,14 +837,24 @@ impl ElementCx<'_, '_> {
                 };
             }
 
-            // Render text
-            crate::text::stroke_text(
-                scene,
-                input_data.editor.try_layout().unwrap().lines(),
-                self.context.dom,
-                transform,
-                self.scale,
-            );
+            // Render text — or, while it is empty, the placeholder, faded.
+            match input_data.placeholder.as_ref().filter(|_| input_data.editor.raw_text().is_empty()) {
+                Some(placeholder) => crate::text::stroke_text_faded(
+                    scene,
+                    placeholder.lines(),
+                    self.context.dom,
+                    transform,
+                    self.scale,
+                    0.45,
+                ),
+                None => crate::text::stroke_text(
+                    scene,
+                    input_data.editor.try_layout().unwrap().lines(),
+                    self.context.dom,
+                    transform,
+                    self.scale,
+                ),
+            }
         }
     }
 

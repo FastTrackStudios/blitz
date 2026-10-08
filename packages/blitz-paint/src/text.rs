@@ -87,6 +87,18 @@ pub(crate) fn stroke_text<'a>(
     transform: Affine,
     scale: f64,
 ) {
+    stroke_text_faded(scene, lines, doc, transform, scale, 1.0);
+}
+
+/// [`stroke_text`] at `alpha` of its colour — an input's placeholder.
+pub(crate) fn stroke_text_faded<'a>(
+    scene: &mut impl PaintScene,
+    lines: impl Iterator<Item = Line<'a, TextBrush>>,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    alpha: f32,
+) {
     for line in lines {
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -108,7 +120,7 @@ pub(crate) fn stroke_text<'a>(
                     .unwrap();
                 let itext_styles = styles.get_inherited_text();
                 let text_styles = styles.get_text();
-                let text_color = itext_styles.color.as_color_color();
+                let text_color = itext_styles.color.as_color_color().multiply_alpha(alpha);
                 let text_decoration_color = text_styles
                     .text_decoration_color
                     .as_absolute()
