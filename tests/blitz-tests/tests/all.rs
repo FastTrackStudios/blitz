@@ -59,6 +59,7 @@ mod render_blocking_stylesheet;
 mod resize_restyle;
 mod rotate_z_axis;
 mod scoped_query_selector;
+mod scroll_into_view;
 mod scrollbar_drag;
 mod scrollbars;
 mod stale_dirty_descendants;
