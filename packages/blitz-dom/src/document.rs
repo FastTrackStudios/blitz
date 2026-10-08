@@ -2107,6 +2107,48 @@ impl BaseDocument {
         })
     }
 
+    /// Scroll the nearest scrolling ancestor of `node_id` so the node is in
+    /// view — centred in it when it was not (as a browser's
+    /// `scrollIntoView({ block: "center" })`); nothing when it already is.
+    /// Returns `false` when the node has no layout yet (try again after it
+    /// is laid out) and `true` otherwise.
+    pub fn scroll_node_into_view(&mut self, node_id: usize) -> bool {
+        let Some(node) = self.nodes.get(node_id) else {
+            return true;
+        };
+        let height = f64::from(node.final_layout.size.height);
+        if height <= 0.0 {
+            return false;
+        }
+        // The nearest ancestor that scrolls vertically.
+        let mut at = node.parent;
+        let scroller = loop {
+            let Some(id) = at else { return true };
+            let Some(n) = self.nodes.get(id) else { return true };
+            let scrolls = n
+                .primary_styles()
+                .is_some_and(|s| matches!(s.clone_overflow_y(), Overflow::Scroll | Overflow::Auto));
+            if scrolls {
+                break id;
+            }
+            at = n.parent;
+        };
+        let (Some(target), Some(sc)) = (self.nodes.get(node_id), self.nodes.get(scroller)) else {
+            return true;
+        };
+        // Where the node sits in the scroller's content (both positions
+        // take the scroller's own offset off, so it cancels).
+        let top = f64::from(target.absolute_position(0.0, 0.0).y - sc.absolute_position(0.0, 0.0).y) + sc.scroll_offset.y;
+        let view = f64::from(sc.final_layout.size.height);
+        let current = sc.scroll_offset.y;
+        if top >= current && top + height <= current + view {
+            return true;
+        }
+        let want = (top - (view - height) / 2.0).max(0.0);
+        self.scroll_node_by(scroller, 0.0, current - want, |_| {});
+        true
+    }
+
     /// Scroll the viewport so that the given node is aligned with the top of the viewport.
     pub fn scroll_to_node(&mut self, node_id: usize) {
         let Some(node) = self.nodes.get(node_id) else {
