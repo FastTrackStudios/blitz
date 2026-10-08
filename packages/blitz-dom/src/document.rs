@@ -369,6 +369,8 @@ pub struct BaseDocument {
     /// When each scroll container's overlay scrollbars were last shown
     /// (scrolled, or the pointer left the thumb); drives their fade-out
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
+    /// FTS: the `position: sticky` nodes, found when layout runs.
+    pub(crate) sticky_nodes: Vec<NodeId>,
     /// Whether and what kind of scroll animation is currently in progress
     pub(crate) scroll_animation: ScrollAnimationState,
 
@@ -599,6 +601,7 @@ impl BaseDocument {
             drag_mode: DragMode::None,
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
+            sticky_nodes: Vec::new(),
             scroll_animation: ScrollAnimationState::None,
             text_selection: TextSelection::default(),
         };

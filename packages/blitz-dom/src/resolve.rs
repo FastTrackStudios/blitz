@@ -9,6 +9,7 @@ use parley::LayoutContext;
 use selectors::Element as _;
 use style::dom::TDocument;
 use style::selector_parser::RestyleDamage;
+use stylo_taffy::CopyStyleGetters;
 
 #[cfg(feature = "parallel-construct")]
 use rayon::prelude::*;
@@ -153,11 +154,17 @@ impl BaseDocument {
             for (_, node) in self.nodes.iter_mut() {
                 node.unset_dirty_descendants();
             }
+            // A scroll moves no layout, but it moves what sticks.
+            if !self.sticky_nodes.is_empty() {
+                self.apply_sticky(false);
+                self.nodes.bump_geometry_generation();
+            }
         } else if skip_allowed && !needs_layout {
             self.propagate_damage_flags(root_node_id);
             timer.record_time("damage");
             self.flush_pending_style_images();
             self.resolve_transforms(root_node_id);
+            self.apply_sticky(false);
             timer.record_time("transform");
             self.build_paint_tree(root_node_id);
             timer.record_time("paint_tree");
@@ -182,6 +189,7 @@ impl BaseDocument {
             // Next we resolve layout with the data resolved by stlist
             self.resolve_layout();
             timer.record_time("layout");
+            self.apply_sticky(true);
             self.nodes.bump_geometry_generation();
 
             // Resolve transforms
@@ -502,6 +510,104 @@ impl BaseDocument {
     ///
     /// TODO: update taffy to use an associated type instead of slab key
     /// TODO: update taffy to support traited styles so we don't even need to rely on taffy for storage
+    /// FTS: `position: sticky` (top only). Layout places a sticky node as
+    /// a relative one; this moves it down so it stays `top` below the top
+    /// of its nearest vertically scrolling ancestor while that is scrolled
+    /// past it — never out of its parent. The move is written into
+    /// `final_layout.location.y` (and remembered in `sticky_shift`), so
+    /// painting and hit testing see it. `fresh`: layout just ran, so the
+    /// locations are layout's own.
+    pub(crate) fn apply_sticky(&mut self, fresh: bool) {
+        use style::values::computed::Overflow;
+        if fresh {
+            self.sticky_nodes = self
+                .nodes
+                .iter()
+                .filter(|(_, n)| {
+                    n.primary_styles().is_some_and(|s| {
+                        matches!(
+                            s.clone_position(),
+                            style::computed_values::position::T::Sticky
+                        )
+                    })
+                })
+                .map(|(id, _)| id)
+                .collect();
+            for &id in &self.sticky_nodes {
+                self.nodes[id].layout_data_mut().sticky_shift = 0.0;
+            }
+        }
+        // Outermost first: a sticky node inside a sticky one moves with it.
+        let depth = |doc: &Self, id: NodeId| {
+            let mut n = 0usize;
+            let mut at = doc.nodes.get(id).and_then(|n| n.layout_parent.get());
+            while let Some(p) = at {
+                n += 1;
+                at = doc.nodes.get(p).and_then(|n| n.layout_parent.get());
+            }
+            n
+        };
+        let mut order: Vec<(usize, NodeId)> = self
+            .sticky_nodes
+            .iter()
+            .map(|&id| (depth(self, id), id))
+            .collect();
+        order.sort_unstable_by_key(|(depth, _)| *depth);
+        for (_, id) in order {
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
+            let top = {
+                let Some(styles) = node.primary_styles() else {
+                    continue;
+                };
+                stylo_taffy::convert::inset(&styles.get_position().top)
+                    .resolve_to_option(0.0, |_, _| 0.0)
+            };
+            let Some(top) = top else { continue };
+            // Where layout put it, which is where it sits unstuck: Taffy
+            // places `Position::Sticky` at its static position (it used to
+            // be converted to `Relative`, which moved it down by `top`).
+            let laid = node.final_layout().location.y - node.layout_data().sticky_shift;
+            let base = laid;
+            let height = node.final_layout().size.height;
+            let Some(parent) = node.layout_parent.get() else {
+                continue;
+            };
+            // Up to the scroller: the parent's top in its content, and the
+            // parent's height (what the node must stay inside).
+            let parent_h = self
+                .nodes
+                .get(parent)
+                .map_or(0.0, |p| p.final_layout().size.height);
+            let mut parent_y = 0.0f32;
+            let mut scroller = None;
+            let mut at = Some(parent);
+            while let Some(a) = at {
+                let Some(n) = self.nodes.get(a) else { break };
+                let scrolls = n.primary_styles().is_some_and(|s| {
+                    matches!(s.clone_overflow_y(), Overflow::Scroll | Overflow::Auto)
+                });
+                if scrolls {
+                    scroller = Some(a);
+                    break;
+                }
+                parent_y += n.final_layout().location.y;
+                // Locations are relative to the containing block (an
+                // out-of-flow box's is not its layout parent).
+                at = n.containing_block();
+            }
+            let Some(scroller) = scroller else { continue };
+            let scroll = self.nodes[scroller].scroll_offset().y as f32;
+            let at_y = parent_y + base;
+            let want = at_y.max(scroll + top);
+            let shift = (want.min(parent_y + parent_h - height) - at_y).max(0.0);
+            let node = &mut self.nodes[id];
+            node.final_layout_mut().location.y = base + shift;
+            node.layout_data_mut().sticky_shift = base + shift - laid;
+        }
+    }
+
     pub fn resolve_layout(&mut self) {
         let size = self.stylist.device().au_viewport_size();
 
