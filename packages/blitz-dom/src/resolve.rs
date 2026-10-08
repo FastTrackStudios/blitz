@@ -121,10 +121,16 @@ impl BaseDocument {
             for (_, node) in self.nodes.iter_mut() {
                 node.unset_dirty_descendants();
             }
+            // A scroll moves no layout, but it moves what sticks.
+            if !self.sticky_nodes.is_empty() {
+                self.apply_sticky(false);
+                self.refresh_hoisted_positions();
+            }
         } else if skip_allowed && !needs_layout {
             self.propagate_damage_flags(root_node_id, RestyleDamage::empty());
             timer.record_time("damage");
             self.resolve_transforms(root_node_id);
+            self.apply_sticky(false);
             self.refresh_hoisted_positions();
             timer.record_time("transform");
             for (_, node) in self.nodes.iter_mut() {
@@ -152,6 +158,7 @@ impl BaseDocument {
             // Next we resolve layout with the data resolved by stlist
             self.resolve_layout();
             timer.record_time("layout");
+            self.apply_sticky(true);
 
             self.resolve_transforms(root_node_id);
             self.refresh_hoisted_positions();
@@ -425,6 +432,78 @@ impl BaseDocument {
     ///
     /// TODO: update taffy to use an associated type instead of slab key
     /// TODO: update taffy to support traited styles so we don't even need to rely on taffy for storage
+    /// FTS: `position: sticky` (top only). Layout places a sticky node as
+    /// a relative one; this moves it down so it stays `top` below the top
+    /// of its nearest vertically scrolling ancestor while that is scrolled
+    /// past it — never out of its parent. The move is written into
+    /// `final_layout.location.y` (and remembered in `sticky_shift`), so
+    /// painting and hit testing see it. `fresh`: layout just ran, so the
+    /// locations are layout's own.
+    pub(crate) fn apply_sticky(&mut self, fresh: bool) {
+        use style::values::computed::Overflow;
+        if fresh {
+            self.sticky_nodes = self
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.primary_styles().is_some_and(|s| matches!(s.clone_position(), style::computed_values::position::T::Sticky)))
+                .map(|(id, _)| id)
+                .collect();
+            for &id in &self.sticky_nodes {
+                self.nodes[id].sticky_shift = 0.0;
+            }
+        }
+        // Outermost first: a sticky node inside a sticky one moves with it.
+        let depth = |doc: &Self, id: usize| {
+            let mut n = 0usize;
+            let mut at = doc.nodes.get(id).and_then(|n| n.layout_parent.get());
+            while let Some(p) = at {
+                n += 1;
+                at = doc.nodes.get(p).and_then(|n| n.layout_parent.get());
+            }
+            n
+        };
+        let mut order: Vec<(usize, usize)> = self.sticky_nodes.iter().map(|&id| (depth(self, id), id)).collect();
+        order.sort_unstable();
+        for (_, id) in order {
+            let Some(node) = self.nodes.get(id) else { continue };
+            let top = {
+                let Some(styles) = node.primary_styles() else { continue };
+                stylo_taffy::convert::inset(&styles.get_position().top).resolve_to_option(0.0, |_, _| 0.0)
+            };
+            let Some(top) = top else { continue };
+            // Where layout put it, and where it would sit unstuck: layout
+            // treats sticky as relative, so it moved it down by `top`.
+            let laid = node.final_layout.location.y - node.sticky_shift;
+            let base = laid - top;
+            let height = node.final_layout.size.height;
+            let Some(parent) = node.layout_parent.get() else { continue };
+            // Up to the scroller: the parent's top in its content, and the
+            // parent's height (what the node must stay inside).
+            let parent_h = self.nodes.get(parent).map_or(0.0, |p| p.final_layout.size.height);
+            let mut parent_y = 0.0f32;
+            let mut scroller = None;
+            let mut at = Some(parent);
+            while let Some(a) = at {
+                let Some(n) = self.nodes.get(a) else { break };
+                let scrolls = n.primary_styles().is_some_and(|s| matches!(s.clone_overflow_y(), Overflow::Scroll | Overflow::Auto));
+                if scrolls {
+                    scroller = Some(a);
+                    break;
+                }
+                parent_y += n.final_layout.location.y;
+                at = n.layout_parent.get();
+            }
+            let Some(scroller) = scroller else { continue };
+            let scroll = self.nodes[scroller].scroll_offset.y as f32;
+            let at_y = parent_y + base;
+            let want = at_y.max(scroll + top);
+            let shift = (want.min(parent_y + parent_h - height) - at_y).max(0.0);
+            let node = &mut self.nodes[id];
+            node.final_layout.location.y = base + shift;
+            node.sticky_shift = base + shift - laid;
+        }
+    }
+
     pub fn resolve_layout(&mut self) {
         let size = self.stylist.device().au_viewport_size();
 

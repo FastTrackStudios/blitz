@@ -143,6 +143,10 @@ pub struct Node {
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
     pub scroll_offset: crate::Point<f64>,
+    /// FTS: how far `position: sticky` has moved this node down from where
+    /// layout put it (baked into `final_layout.location.y`; see
+    /// `BaseDocument::apply_sticky`).
+    pub sticky_shift: f32,
 
     pub scrollable_overflow: KurboRect,
     pub transform: Option<Affine>,
@@ -206,6 +210,7 @@ impl Node {
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             scroll_offset: crate::Point::ZERO,
+            sticky_shift: 0.0,
 
             scrollable_overflow: KurboRect::ZERO,
             transform: None,
