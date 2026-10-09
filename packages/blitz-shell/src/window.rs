@@ -260,7 +260,13 @@ impl<Rend: WindowRenderer> View<Rend> {
             #[cfg(target_arch = "wasm32")]
             resize_timer_scheduled: false,
             pointer_pos: Default::default(),
-            pacing: Pacing::from_env(),
+            pacing: Pacing::from_env(
+                winit_window
+                    .current_monitor()
+                    .and_then(|m| m.current_video_mode())
+                    .and_then(|v| v.refresh_rate_millihertz())
+                    .map(|mhz| mhz.get() / 1000),
+            ),
             paint_page: true,
             is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
@@ -485,7 +491,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             self.frame_now();
             return;
         };
-        let wait = self.pacing.wait_for_next(min, Duration::ZERO);
+        let wait = self.pacing.wait_for_next(min, Duration::ZERO, IDLE_CLOCK);
         if wait.is_zero() {
             self.frame_now();
             return;
@@ -494,11 +500,18 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 
     /// FTS (iOS): the next frame of an animation, after the pace's wait
-    /// (at least a few ms) and always through the event loop.
+    /// (at least a few ms) and always through the event loop. `display`: a
+    /// document animation (a scroll coasting), drawn at the screen's rate
+    /// with a short idle between frames; else a clock (a face, a meter),
+    /// at the pace with the longer idle that keeps touches answered.
     #[cfg(target_os = "ios")]
-    fn request_timed_redraw(&mut self) {
-        let min = self.pacing.min_frame.unwrap_or(Duration::from_millis(16));
-        let wait = self.pacing.wait_for_next(min, Duration::from_millis(4));
+    fn request_timed_redraw(&mut self, display: bool) {
+        let (min, idle) = if display {
+            (self.pacing.display_frame, IDLE_DISPLAY)
+        } else {
+            (self.pacing.min_frame.unwrap_or(Duration::from_millis(16)), IDLE_CLOCK)
+        };
+        let wait = self.pacing.wait_for_next(min, Duration::from_millis(if display { 1 } else { 4 }), idle);
         // An animation's next frame (a face's lamps, a spring) waits at
         // least as long as the last frame took: animating, the main thread
         // is at most half busy, whatever a frame costs — three amp faces
@@ -579,7 +592,7 @@ impl<Rend: WindowRenderer> View<Rend> {
     /// winit outside a touch is never drawn), elsewhere asked of the window.
     fn next_frame(&mut self) {
         #[cfg(target_os = "ios")]
-        self.request_timed_redraw();
+        self.request_timed_redraw(false);
         #[cfg(not(target_os = "ios"))]
         self.request_redraw();
     }
@@ -708,7 +721,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             crate::frame_stats::asked_again(crate::frame_stats::Why::Unsettled);
             self.paint_page = true;
             #[cfg(target_os = "ios")]
-            self.request_timed_redraw();
+            self.request_timed_redraw(false);
             #[cfg(not(target_os = "ios"))]
             self.request_paced_redraw();
         }
@@ -721,7 +734,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             // frame slower than the pace would otherwise draw the next inside
             // itself, and the run loop — touches with it — never got a turn.
             #[cfg(target_os = "ios")]
-            self.request_timed_redraw();
+            self.request_timed_redraw(true);
             #[cfg(not(target_os = "ios"))]
             self.request_redraw();
         } else if !is_blocked && is_visible && self.doc.inner().widgets_need_redraw() {
@@ -731,7 +744,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             // doesn't, and the window sleeps. (iOS: never inside this frame —
             // see the branch above.)
             #[cfg(target_os = "ios")]
-            self.request_timed_redraw();
+            self.request_timed_redraw(false);
             #[cfg(not(target_os = "ios"))]
             self.request_paced_redraw();
         }
@@ -1192,10 +1205,22 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 }
 
+/// FTS (iOS): the least idle after a frame before the next — the run loop's
+/// turn for touches. A clock's frames (faces, meters) leave more; a document
+/// animation at the screen's rate (120 Hz: 8.3 ms a frame) cannot afford it.
+const IDLE_CLOCK: Duration = Duration::from_millis(8);
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+const IDLE_DISPLAY: Duration = Duration::from_millis(2);
+
 /// FTS: when the window last drew, and the one deferred redraw queued for
 /// a document update that came too soon after it.
 struct Pacing {
     min_frame: Option<Duration>,
+    /// FTS: the screen's own frame (120 Hz on ProMotion, else 60): what a
+    /// document animation — a scroll coasting, a transition — is drawn at.
+    /// `min_frame` paces the clocks (meters, faces) that would otherwise
+    /// each repaint the window at every vsync.
+    display_frame: Duration,
     last_frame: Instant,
     /// How long the last frame took to draw, start to end.
     last_cost: Duration,
@@ -1223,19 +1248,21 @@ impl Pacing {
     /// otherwise drew the next straight after it, and touches (the rail, a
     /// tab) waited for the frames to stop: the screen looked frozen while a
     /// meter moved. `floor`: the least wait in any case.
-    fn wait_for_next(&self, min: Duration, floor: Duration) -> Duration {
+    fn wait_for_next(&self, min: Duration, floor: Duration, idle_floor: Duration) -> Duration {
         let since = self.last_frame.elapsed();
         let pace = min.saturating_sub(since);
+        #[cfg(not(target_os = "ios"))]
+        let _ = idle_floor;
         #[cfg(target_os = "ios")]
         let pace = {
-            let idle = (self.last_cost / 2).max(Duration::from_millis(8));
+            let idle = (self.last_cost / 2).max(idle_floor);
             let since_end = since.saturating_sub(self.last_cost);
             pace.max(idle.saturating_sub(since_end))
         };
         pace.max(floor)
     }
 
-    fn from_env() -> Self {
+    fn from_env(display_hz: Option<u32>) -> Self {
         let fps = std::env::var("FTS_MAX_FPS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -1244,6 +1271,7 @@ impl Pacing {
         let fps = if cfg!(target_arch = "wasm32") { 0 } else { fps };
         Self {
             min_frame: (fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(fps))),
+            display_frame: Duration::from_secs_f64(1.0 / f64::from(display_hz.filter(|hz| *hz >= 30).unwrap_or(60))),
             last_frame: Instant::now(),
             last_cost: Duration::ZERO,
             pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
