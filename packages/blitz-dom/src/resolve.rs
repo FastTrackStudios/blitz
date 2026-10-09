@@ -117,7 +117,12 @@ impl BaseDocument {
             needs_layout |= !(damage - paint_only).is_empty();
         }
         self.resolve_damaged = !skip_allowed || any_damage;
-        if skip_allowed && !any_damage {
+        // FTS: a keyframe animation of `transform` restyles its node with no
+        // damage stylo reports, so the skip below never resolved its
+        // transform again and it held the first frame's (opacity, read at
+        // paint, still moved). While anything animates, transforms are
+        // resolved each pass.
+        if skip_allowed && !any_damage && !self.has_active_animations {
             for (_, node) in self.nodes.iter_mut() {
                 node.unset_dirty_descendants();
             }
