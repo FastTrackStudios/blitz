@@ -1555,6 +1555,17 @@ impl BaseDocument {
         (hit, scrollbar)
     }
 
+    /// FTS: whether a pointer event lies outside the window, in the CSS
+    /// pixels its client coordinates are in. A held pointer out there keeps
+    /// its target instead of being hit-tested (studio#141).
+    pub(crate) fn is_outside_viewport(&self, event: &blitz_traits::events::BlitzPointerEvent) -> bool {
+        let viewport = self.viewport();
+        let scale = viewport.scale().max(f32::EPSILON);
+        let (width, height) = viewport.window_size;
+        let (x, y) = (event.client_x(), event.client_y());
+        x < 0.0 || y < 0.0 || x >= width as f32 / scale || y >= height as f32 / scale
+    }
+
     pub fn set_hover_to(&mut self, x: f32, y: f32) -> bool {
         let (hit, hovered_scrollbar) = self.hit_with_scrollbar(x, y);
         // A faded-out thumb is not interactive: pointer moves never fade
