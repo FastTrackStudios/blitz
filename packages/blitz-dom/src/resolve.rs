@@ -444,8 +444,62 @@ impl BaseDocument {
         // size. Making this incremental means teaching Taffy to report
         // which nodes it actually recomputed.
         taffy::round_layout(self, root_element_id);
+        self.refresh_hoisted_positions();
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
+    }
+
+    /// FTS: place every hoisted (z-indexed) child from the layout just
+    /// computed.
+    ///
+    /// A hoisted child's offset from its stacking-context root is summed
+    /// from the locations of the ancestors in between — and that sum was
+    /// taken while flushing styles, BEFORE layout: on a first layout every
+    /// location was still zero, and nothing summed it again until a style
+    /// changed. A dropdown inside a cell 300 px in from its bar was hoisted
+    /// at (0, 0), so it was painted at one place and hit-tested at another,
+    /// and a press on it went to whatever lay beneath (studio#178).
+    fn refresh_hoisted_positions(&mut self) {
+        let roots: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.stacking_context
+                    .as_ref()
+                    .is_some_and(|sc| !sc.children.is_empty())
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for root in roots {
+            let Some(mut stacking_context) = self.nodes[root].stacking_context.take() else {
+                continue;
+            };
+            for hoisted in stacking_context.children.iter_mut() {
+                hoisted.position = self.hoisted_offset(root, hoisted.node_id);
+            }
+            stacking_context.compute_content_size(self);
+            self.nodes[root].stacking_context = Some(stacking_context);
+        }
+    }
+
+    /// The offset of `node`'s parent box from stacking-context root `root`:
+    /// the layout locations, less scroll, of the ancestors strictly between
+    /// them, as `flush_styles_to_layout` sums it. Stops at a freed id.
+    fn hoisted_offset(&self, root: usize, node: usize) -> taffy::Point<f32> {
+        let mut offset = taffy::Point::ZERO;
+        let mut current = self.nodes.get(node).and_then(|n| n.layout_parent.get());
+        while let Some(id) = current {
+            if id == root {
+                break;
+            }
+            let Some(ancestor) = self.nodes.get(id) else {
+                break;
+            };
+            offset.x += ancestor.final_layout.location.x - ancestor.scroll_offset.x as f32;
+            offset.y += ancestor.final_layout.location.y - ancestor.scroll_offset.y as f32;
+            current = ancestor.layout_parent.get();
+        }
+        offset
     }
 }

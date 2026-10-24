@@ -1088,16 +1088,19 @@ impl Node {
             || y < 0.0
             || y > content_size.height + self.scroll_offset.y as f32);
 
-        let matches_hoisted_content = match &self.stacking_context {
-            Some(sc) => {
-                let content_area = sc.content_area;
-                x >= content_area.left + self.scroll_offset.x as f32
-                    && x <= content_area.right + self.scroll_offset.x as f32
-                    && y >= content_area.top + self.scroll_offset.y as f32
-                    && y <= content_area.bottom + self.scroll_offset.y as f32
-            }
-            None => false,
-        };
+        // FTS: a stacking context's hoisted children are always tried; each
+        // one tests its own bounds, transform included. Gating them on the
+        // context's `content_area` missed real hits: that area is built from
+        // each child's untransformed box, during the style flush (so from
+        // the previous layout), and it stops at the child's own box, never
+        // reaching the child's own hoisted descendants. A dropdown centred
+        // with `translateX(-50%)` and z-indexed inside a z-indexed bar
+        // inside a z-indexed header lay outside every area on the way down,
+        // so a press on it went to the panel underneath (studio#178).
+        let matches_hoisted_content = self
+            .stacking_context
+            .as_ref()
+            .is_some_and(|sc| !sc.children.is_empty());
 
         // `scrollable_overflow` is stored in device (scaled) pixels, whereas the
         // coordinates here are in CSS pixels, so unscale it before comparing.

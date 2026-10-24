@@ -521,6 +521,27 @@ pub(crate) fn handle_pointerdown(
     );
 }
 
+/// FTS: where a click goes — the nearest common inclusive ancestor of the
+/// node the press landed on and the node the release did (UI Events), not
+/// whatever is under the release. Pressed on one button and released over
+/// another, that is their parent, so neither button is clicked: on a rig, a
+/// knob dragged and let go over a footswitch does not press it.
+///
+/// With no press on record (a release that arrived alone) the release's
+/// target, as before. Ids are looked up, not unwrapped: the pressed node can
+/// be gone by the release, and then there is nothing they share.
+fn click_target(doc: &BaseDocument, pressed: Option<usize>, released: usize) -> Option<usize> {
+    let Some(pressed) = pressed else {
+        return Some(released);
+    };
+    let ancestors = |start: usize| {
+        std::iter::successors(Some(start), |id| doc.nodes.get(*id).and_then(|n| n.parent))
+            .take_while(|id| doc.nodes.contains(*id))
+    };
+    let pressed_chain: Vec<usize> = ancestors(pressed).collect();
+    ancestors(released).find(|id| pressed_chain.contains(id))
+}
+
 pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
     doc: &mut BaseDocument,
     target: usize,
@@ -566,9 +587,14 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
         }
     }
 
-    // Dispatch a click event
+    // Dispatch a click event, to what the press and the release share.
     if do_click && event.button == MouseEventButton::Main {
-        dispatch_event(DomEvent::new(target, DomEventData::Click(event.clone())));
+        if let Some(click_target) = click_target(doc, doc.mousedown_node_id, target) {
+            dispatch_event(DomEvent::new(
+                click_target,
+                DomEventData::Click(event.clone()),
+            ));
+        }
     }
 
     // Dispatch a context menu event
