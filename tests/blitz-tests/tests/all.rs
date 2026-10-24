@@ -29,6 +29,7 @@ mod focus_within;
 mod focusability_updates;
 mod fragment_navigation;
 mod harness_smoke;
+mod held_pointer_outside;
 mod hit_test_dropped_nodes;
 mod hover_dom_ancestors;
 mod incremental_oracle;
