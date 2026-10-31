@@ -169,7 +169,10 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
     let y = event.page_y();
     let buttons = event.buttons;
 
-    let mut changed = doc.set_hover_to(x, y);
+    // FTS: a held pointer outside the window keeps its target (studio#141;
+    // see `EventDriver::handle_pointer_move_held`).
+    let held_outside = buttons != MouseEventButtons::None && doc.is_outside_viewport(event);
+    let mut changed = !held_outside && doc.set_hover_to(x, y);
 
     // Check if we've moved enough to be considered a drag: 2px for a mouse
     // or pen (a selection), but a finger gets a tap's slop first. A fingertip
