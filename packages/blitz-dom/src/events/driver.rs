@@ -44,6 +44,28 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
     }
 
     pub fn handle_pointer_move(&mut self, event: &BlitzPointerEvent) -> Option<usize> {
+        self.handle_pointer_move_held(event, false)
+    }
+
+    /// FTS: [`handle_pointer_move`](Self::handle_pointer_move), knowing
+    /// whether this event belongs to a press in progress (`held`).
+    ///
+    /// A held pointer that has left the window keeps its target: the node it
+    /// was over when it left goes on receiving the drag at its true
+    /// coordinates, and the release that ends it. Hit-testing a point outside
+    /// the viewport finds nothing and falls back to the root, so a drag that
+    /// ran past the window edge was lost; the embedder used to clamp the
+    /// coordinates to keep it alive, which froze every control at the edge
+    /// (studio#141). Inside the window a held pointer is hit-tested as ever,
+    /// so a drag overlay mounted on press still takes the moves.
+    pub(crate) fn handle_pointer_move_held(
+        &mut self,
+        event: &BlitzPointerEvent,
+        held: bool,
+    ) -> Option<usize> {
+        if held && self.doc.inner().is_outside_viewport(event) {
+            return self.doc.inner().hover_node_id;
+        }
         let mut doc = self.doc.inner_mut();
 
         let prev_hover_node_id = doc.hover_node_id;
@@ -155,7 +177,8 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
         // Update document input state (hover, focus, active, etc)
         match &event {
             UiEvent::PointerMove(event) => {
-                hover_node_id = self.handle_pointer_move(event);
+                let held = !event.buttons.is_empty();
+                hover_node_id = self.handle_pointer_move_held(event, held);
             }
             UiEvent::PointerDown(event) => {
                 hover_node_id = self.handle_pointer_move(event);
@@ -168,7 +191,8 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
                 }
             }
             UiEvent::PointerUp(event) => {
-                hover_node_id = self.handle_pointer_move(event);
+                // The release that ends a drag is part of it, wherever it is.
+                hover_node_id = self.handle_pointer_move_held(event, true);
                 let mut doc = self.doc.inner_mut();
                 doc.unactive_node();
 
