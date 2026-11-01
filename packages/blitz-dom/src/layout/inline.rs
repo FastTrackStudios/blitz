@@ -469,6 +469,16 @@ impl BaseDocument {
             return LayoutOutput::from_outer_size(clamped_size);
         }
 
+        // A measure (`ComputeSize`) breaks the lines at the width it asks
+        // about, but what is drawn is the last `PerformLayout`'s lines. Taffy
+        // answers a `PerformLayout` whose inputs have not changed from its
+        // cache, without calling here, so a measure must leave the lines and
+        // the inline boxes as that layout left them: else a paragraph a
+        // parent measured at zero width is drawn one word per line until its
+        // own inputs change.
+        let measuring = inputs.run_mode == taffy::RunMode::ComputeSize;
+        let drawn = measuring.then(|| inline_layout.layout.clone());
+
         #[cfg(not(feature = "floats"))]
         {
             inline_layout.layout.break_all_lines(Some(width));
@@ -663,8 +673,8 @@ impl BaseDocument {
         }
         .maybe_max(container_pb.sum_axes().map(Some));
 
-        // Store sizes and positions of inline boxes
-        for line in inline_layout.layout.lines() {
+        // Store sizes and positions of inline boxes (a measure only sizes)
+        for line in inline_layout.layout.lines().filter(|_| !measuring) {
             for item in line.items() {
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
                     let node = &mut self.nodes[ibox.id as usize];
@@ -711,6 +721,10 @@ impl BaseDocument {
         // println!("Computed: w: {} h: {}", inline_layout.layout.width(), inline_layout.layout.height());
         // println!("known_dimensions: w: {:?} h: {:?}", inputs.known_dimensions.width, inputs.known_dimensions.height);
         // println!("\n");
+
+        if let Some(drawn) = drawn {
+            inline_layout.layout = drawn;
+        }
 
         // Put layout back
         self.nodes[node_id]
