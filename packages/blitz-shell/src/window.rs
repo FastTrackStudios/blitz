@@ -537,11 +537,16 @@ impl<Rend: WindowRenderer> View<Rend> {
         let tx = self.pacing.timer.get_or_insert_with(|| {
             let (tx, rx) = std::sync::mpsc::channel::<(Duration, usize)>();
             let proxy = self.proxy.clone();
+            let pending = Arc::clone(&self.pacing.pending);
             std::thread::Builder::new()
                 .name("blitz-redraw-pacer".into())
                 .spawn(move || {
                     while let Ok((wait, doc_id)) = rx.recv() {
                         std::thread::sleep(wait);
+                        // The paced frame is due: from here a document's
+                        // own redraw request draws (see
+                        // `frame_now_unless_paced`), so this one must too.
+                        pending.store(false, std::sync::atomic::Ordering::Release);
                         proxy.send_event(BlitzShellEvent::RequestRedraw { doc_id });
                     }
                 })
@@ -559,6 +564,18 @@ impl<Rend: WindowRenderer> View<Rend> {
     /// is handling a touch. A poll or a timer asking for one waited for the
     /// next touch: every tap showed the frame before it, and nothing that
     /// moves on its own (a meter, the tuner) moved.
+    /// FTS: a document's own redraw request (`ShellProvider::request_redraw`,
+    /// which upstream also sends after every DOM mutation batch, #580): a
+    /// frame now, unless a paced frame is already on its way. Mutations a
+    /// poll makes are paced to `FTS_MAX_FPS` (see `View::poll`); without
+    /// this the mutator's own request drew each of them at once.
+    pub fn frame_now_unless_paced(&mut self) {
+        if self.pacing.pending.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.frame_now();
+    }
+
     pub fn frame_now(&mut self) {
         #[cfg(target_os = "ios")]
         if self.renderer.is_active() {
