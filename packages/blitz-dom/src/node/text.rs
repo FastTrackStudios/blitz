@@ -25,6 +25,20 @@ pub struct TextLayout {
     pub text: String,
     pub content_widths: Option<ContentWidths>,
     pub layout: parley::layout::Layout<TextBrush>,
+    /// FTS: what the last full layout (not a measure) broke the lines at:
+    /// the width, and each inline box's size. A measure breaks the lines
+    /// at the width it asks about, then puts them back as they were, so a
+    /// full layout served from Taffy's cache still paints what it laid
+    /// out (a text measured at its min-content width stayed wrapped a word
+    /// per line).
+    pub(crate) laid_out: Option<LaidOut>,
+}
+
+/// The line breaking of a [`TextLayout`]'s last full layout.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct LaidOut {
+    pub(crate) width: f32,
+    pub(crate) boxes: Vec<(f32, f32)>,
 }
 
 impl TextLayout {

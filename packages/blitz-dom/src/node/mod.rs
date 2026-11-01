@@ -22,4 +22,5 @@ pub use element::{
 };
 pub use node::*;
 pub use scrollbar::{ScrollbarColor, ScrollbarRef, ScrollbarWidth};
+pub(crate) use text::LaidOut;
 pub use text::{GeneratedTextInputEvent, TextBrush, TextInputData, TextLayout};
