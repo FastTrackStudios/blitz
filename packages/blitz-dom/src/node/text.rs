@@ -33,6 +33,20 @@ pub struct TextLayout {
     /// containing block (as `SPAN_*_CB` flags). The inline root claims those boxes in its place.
     /// Set by each `RunMode::PerformLayout` run of inline layout.
     pub span_cb_flags: stylo_taffy::StyleFlags,
+    /// FTS: what the last full layout (not a measure) broke the lines at:
+    /// the width, and each inline box's size. A measure breaks the lines
+    /// at the width it asks about, then puts them back as they were, so a
+    /// full layout served from Taffy's cache still paints what it laid
+    /// out (a text measured at its min-content width stayed wrapped a word
+    /// per line).
+    pub(crate) laid_out: Option<LaidOut>,
+}
+
+/// The line breaking of a [`TextLayout`]'s last full layout.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct LaidOut {
+    pub(crate) width: f32,
+    pub(crate) boxes: Vec<(f32, f32)>,
 }
 
 impl TextLayout {

@@ -905,6 +905,53 @@ impl LayoutPassState<'_> {
         }
         .maybe_max(container_pb.sum_axes().map(Some));
 
+        // FTS: a measure leaves the lines and the boxes as the last full
+        // layout laid them out (Taffy may serve that layout from its cache
+        // and never call this again, and what is painted is the lines).
+        // Re-broken at the full layout's width; with floats that is the
+        // layout's max advance, not each line's float-narrowed one.
+        if inputs.run_mode != RunMode::PerformLayout {
+            if let Some(laid_out) = inline_layout.laid_out.clone() {
+                for (ibox, (w, h)) in inline_layout
+                    .layout
+                    .inline_boxes_mut()
+                    .zip(laid_out.boxes.iter().copied())
+                {
+                    ibox.width = w;
+                    ibox.height = h;
+                }
+                let resolved_text_indent = text_indent
+                    .length
+                    .resolve(CSSPixelLength::new((laid_out.width / scale).max(0.0)))
+                    .px();
+                inline_layout
+                    .layout
+                    .set_text_indent(resolved_text_indent * scale, indent_options);
+                inline_layout.layout.break_all_lines(Some(laid_out.width));
+                inline_layout.layout.align(
+                    alignment,
+                    AlignmentOptions {
+                        align_when_overflowing: false,
+                        last_line_alignment,
+                    },
+                );
+            }
+            self.nodes[node_id]
+                .data
+                .downcast_element_mut()
+                .unwrap()
+                .inline_layout_data = Some(inline_layout);
+            return LayoutOutput::from_outer_size(final_size);
+        }
+        inline_layout.laid_out = Some(crate::node::LaidOut {
+            width,
+            boxes: inline_layout
+                .layout
+                .inline_boxes()
+                .map(|ibox| (ibox.width, ibox.height))
+                .collect(),
+        });
+
         let container_direction = self.nodes[node_id].layout_style().direction();
 
         // `align-content` aligns the line boxes (as a single unit) within the content box in
@@ -1195,4 +1242,92 @@ impl LayoutPassState<'_> {
 #[inline(always)]
 fn f32_max(a: f32, b: f32) -> f32 {
     a.max(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use blitz_traits::shell::{ColorScheme, Viewport};
+    use markup5ever::{QualName, local_name, ns};
+    use taffy::{
+        AvailableSpace, LayoutInput, LayoutPartialTree, Line, RequestedAxis, RunMode, Size,
+        SizingMode,
+    };
+
+    use crate::layout::LayoutPassState;
+    use crate::{BaseDocument, DocumentConfig};
+
+    fn element(name: markup5ever::LocalName) -> QualName {
+        QualName::new(None, ns!(html), name)
+    }
+
+    /// FTS: a measure of a text's height at another width (a flex parent
+    /// sizing a child) must leave its lines as its last full layout broke
+    /// them: Taffy may serve that layout from its cache, and what is
+    /// painted is the lines. It used to keep the measure's, so a note
+    /// measured at its min-content width painted a word per line.
+    #[test]
+    fn a_measure_leaves_the_lines_as_laid_out() {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(600, 400, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root = doc.root_node().id;
+        let p = {
+            let mut m = doc.mutate();
+            let html = m.create_element(element(local_name!("html")), vec![]);
+            let body = m.create_element(element(local_name!("body")), vec![]);
+            let p = m.create_element(element(local_name!("p")), vec![]);
+            let text = m.create_text_node("one two three four five six seven eight");
+            m.append_children(p, &[text]);
+            m.append_children(body, &[p]);
+            m.append_children(html, &[body]);
+            m.append_children(root, &[html]);
+            p
+        };
+        doc.resolve(0.0);
+        let lines = |doc: &BaseDocument| {
+            doc.nodes[p]
+                .element_data()
+                .and_then(|e| e.inline_layout_data.as_ref())
+                .map_or(0, |t| t.layout.len())
+        };
+        let laid_out = lines(&doc);
+        assert!(laid_out >= 1);
+
+        let narrow = 30.0;
+        let measured = LayoutPassState::new(&mut doc).compute_child_layout(
+            crate::taffy_node_id(p),
+            LayoutInput {
+                run_mode: RunMode::ComputeSize,
+                sizing_mode: SizingMode::InherentSize,
+                axis: RequestedAxis::Vertical,
+                known_dimensions: Size {
+                    width: Some(narrow),
+                    height: None,
+                },
+                known_dimensions_are_definite: Size {
+                    width: true,
+                    height: true,
+                },
+                parent_size: Size {
+                    width: Some(narrow),
+                    height: None,
+                },
+                available_space: Size {
+                    width: AvailableSpace::Definite(narrow),
+                    height: AvailableSpace::MaxContent,
+                },
+                vertical_margins_are_collapsible: Line::FALSE,
+            },
+        );
+        // The measure saw the narrow lines (with a font to measure by)...
+        let full = doc.nodes[p].unrounded_layout().size.height;
+        assert!(
+            measured.size.height > full * 2.0,
+            "measured {} vs laid out {full}",
+            measured.size.height
+        );
+        // ...and left the laid-out ones as they were.
+        assert_eq!(lines(&doc), laid_out);
+    }
 }
