@@ -20,7 +20,9 @@ use wgpu_context::{
     TextureConfiguration, WGPUContext,
 };
 
+use crate::compositor::Compositor;
 use crate::{DEFAULT_THREADS, VelloScenePainter};
+use anyrender::PaintScene;
 
 /// Drive the wgpu init future. On wasm32 we spawn it onto the JS microtask
 /// queue (blocking is not allowed). On native we drive it inline with
@@ -39,6 +41,8 @@ fn spawn_init<F: Future<Output = ()>>(f: F) {
 struct ActiveRenderState {
     renderer: VelloRenderer,
     render_surface: SurfaceRenderer<'static>,
+    /// FTS: the kept base and the layer pass (see `crate::compositor`).
+    compositor: Compositor,
 }
 
 /// Result of a successful asynchronous resume; both the active state and the
@@ -78,7 +82,12 @@ pub struct VelloRendererOptions {
 
 impl Default for VelloRendererOptions {
     fn default() -> Self {
-        Self::new()
+        // FTS: the surface's clear colour from `ANYRENDER_BASE_COLOR`
+        // (see `base_color_from_env`); `new` is `const` and cannot read it.
+        Self {
+            base_color: base_color_from_env().unwrap_or(Color::WHITE),
+            ..Self::new()
+        }
     }
 }
 
@@ -148,11 +157,32 @@ impl VelloRendererOptions {
 impl From<anyrender::RendererConfig> for VelloRendererOptions {
     fn from(config: anyrender::RendererConfig) -> Self {
         Self {
-            base_color: config.base_color.unwrap_or(Color::WHITE),
+            // FTS: an explicit colour wins; `ANYRENDER_BASE_COLOR` is the
+            // fallback before upstream's white.
+            base_color: config
+                .base_color
+                .or_else(base_color_from_env)
+                .unwrap_or(Color::WHITE),
             composite_alpha_mode: config.composite_alpha_mode.unwrap_or_default(),
             ..Default::default()
         }
     }
+}
+
+/// FTS: the colour the surface is cleared to, `ANYRENDER_BASE_COLOR=#rrggbb`.
+/// What it shows is every pixel the page does not paint — on iOS the safe
+/// area's strips outside the page's viewport (Blitz lays the page out
+/// inside the insets and fills only the viewport with the root's
+/// background). Upstream's white made a white strip along an iPad's
+/// bottom edge under a dark app; the app sets its own ground here.
+fn base_color_from_env() -> Option<Color> {
+    let v = std::env::var("ANYRENDER_BASE_COLOR").ok()?;
+    let hex = v.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let ch = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    Some(Color::from_rgb8(ch(0)?, ch(2)?, ch(4)?))
 }
 
 pub struct VelloWindowRenderer {
@@ -167,6 +197,8 @@ pub struct VelloWindowRenderer {
 
     // Resources
     texture_handles: FxHashMap<ResourceId, ImageData>,
+    /// FTS: the same textures, viewable, for compositing them as layers.
+    texture_views: FxHashMap<ResourceId, wgpu::TextureView>,
 }
 
 impl VelloWindowRenderer {
@@ -184,6 +216,7 @@ impl VelloWindowRenderer {
             window_handle: None,
             scene: VelloScene::new(),
             texture_handles: FxHashMap::default(),
+            texture_views: FxHashMap::default(),
         }
     }
 
@@ -206,6 +239,10 @@ impl RenderContext for VelloWindowRenderer {
 
         if let Ok(texture) = resource.downcast::<Texture>() {
             let id = ResourceId::new();
+            self.texture_views.insert(
+                id,
+                texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            );
             self.texture_handles
                 .insert(id, active.renderer.register_texture(*texture));
             Ok(id)
@@ -222,6 +259,8 @@ impl RenderContext for VelloWindowRenderer {
         if let Some(handle) = self.texture_handles.remove(&resource_id) {
             active.renderer.unregister_texture(handle);
         }
+        self.texture_views.remove(&resource_id);
+        active.compositor.forget(resource_id);
     }
 
     fn renderer_specific_context(&self) -> Option<Box<dyn std::any::Any>> {
@@ -350,7 +389,12 @@ impl WindowRenderer for VelloWindowRenderer {
 
             #[cfg(not(target_vendor = "apple"))]
             let texture_config = Some(TextureConfiguration {
-                usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+                // FTS: RENDER_ATTACHMENT for the compositor's pass, which
+                // draws the window's frame (vello renders into the
+                // compositor's base).
+                usage: TextureUsages::STORAGE_BINDING
+                    | TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::RENDER_ATTACHMENT,
                 format: TextureFormat::Rgba8Unorm,
                 alpha_conversion: (composite_alpha_mode == CompositeAlphaMode::PreMultiplied)
                     .then_some(AlphaConversion::Premultiply),
@@ -358,22 +402,50 @@ impl WindowRenderer for VelloWindowRenderer {
             // TODO: Remove below once gfx-rs/wgpu#9896 gets fixed
             #[cfg(target_vendor = "apple")]
             let texture_config = Some(TextureConfiguration {
-                usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+                // FTS: RENDER_ATTACHMENT for the compositor's pass, which
+                // draws the window's frame (vello renders into the
+                // compositor's base).
+                usage: TextureUsages::STORAGE_BINDING
+                    | TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::RENDER_ATTACHMENT,
                 format: TextureFormat::Rgba8Unorm,
                 alpha_conversion: (composite_alpha_mode == CompositeAlphaMode::PostMultiplied
                     || composite_alpha_mode == CompositeAlphaMode::PreMultiplied)
                     .then_some(AlphaConversion::Premultiply),
             });
 
+            // FTS: always through the intermediate texture — the
+            // compositor renders the window's frame into it, so the
+            // direct-surface path (`FTS_DIRECT_SURFACE`, measured to buy
+            // nothing) went with the compositor's arrival.
+            let surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
             let render_surface = SurfaceRenderer::new(
                 surface,
                 SurfaceRendererConfiguration {
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: surface_usage,
                     formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm],
                     width,
                     height,
-                    present_mode: PresentMode::AutoVsync,
-                    desired_maximum_frame_latency,
+                    // FTS: switchable, so vsync can be ruled in or out by
+                    // measurement rather than argued about. `AutoVsync`
+                    // blocks on the compositor's cadence, which makes a
+                    // slow frame and a frame that is merely WAITING look
+                    // identical from the outside.
+                    present_mode: match std::env::var("FTS_PRESENT").as_deref() {
+                        Ok("immediate") => PresentMode::AutoNoVsync,
+                        Ok("mailbox") => PresentMode::Mailbox,
+                        _ => PresentMode::AutoVsync,
+                    },
+                    // FTS: `FTS_FRAME_LATENCY` overrides the configured
+                    // latency (1 by default since anyrender_vello 0.15,
+                    // which took the measurement this fork made: at 2560x1440
+                    // acquire-and-present went from 6.7ms at a latency of
+                    // two to 2.2ms at one), because it is the sort of number
+                    // that wants re-measuring on a different compositor.
+                    desired_maximum_frame_latency: std::env::var("FTS_FRAME_LATENCY")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(desired_maximum_frame_latency),
                     alpha_mode: composite_alpha_mode,
                     view_formats: vec![],
                 },
@@ -393,10 +465,12 @@ impl WindowRenderer for VelloWindowRenderer {
             )
             .unwrap();
 
+            let compositor = Compositor::new(render_surface.device());
             let _ = sender.send(InitOutput {
                 active: ActiveRenderState {
                     renderer,
                     render_surface,
+                    compositor,
                 },
             });
             on_ready();
@@ -412,6 +486,9 @@ impl WindowRenderer for VelloWindowRenderer {
                     let device_handle = active.render_surface.device_handle.clone();
                     self.wgpu_context.device_pool.push(device_handle);
                     self.render_state = RenderState::Active(active);
+                    anyrender::composite::set_supported(
+                        std::env::var_os("FTS_NO_COMPOSITE").is_none(),
+                    );
                     true
                 }
                 _ => false,
@@ -425,6 +502,9 @@ impl WindowRenderer for VelloWindowRenderer {
             for (_id, handle) in self.texture_handles.drain() {
                 active.renderer.unregister_texture(handle);
             }
+            self.texture_views.clear();
+            active.compositor.clear();
+            anyrender::composite::set_supported(false);
         }
         self.render_state = RenderState::Suspended;
     }
@@ -441,17 +521,97 @@ impl WindowRenderer for VelloWindowRenderer {
         };
 
         let render_surface = &mut state.render_surface;
+        let size = (render_surface.config.width, render_surface.config.height);
 
         debug_timer!(timer, feature = "log_frame_times");
 
-        // Regenerate the vello scene
-        draw_fn(&mut VelloScenePainter {
-            inner: &mut self.scene,
-            renderer: Some(&mut state.renderer),
-            device_handle: Some(&render_surface.device_handle),
-            texture_handles: Some(&mut self.texture_handles),
-        });
-        timer.record_time("cmd");
+        // FTS: reuse the kept base when the painter says nothing but its
+        // layers changed; otherwise paint and rasterise the page into it.
+        let reuse = anyrender::composite::reuse_requested() && state.compositor.has_base(size);
+        anyrender::composite::set_reused(reuse);
+        if !reuse {
+            // Regenerate the vello scene
+            draw_fn(&mut VelloScenePainter {
+                inner: &mut self.scene,
+                renderer: Some(&mut state.renderer),
+                device_handle: Some(&render_surface.device_handle),
+                texture_handles: Some(&mut self.texture_handles),
+                texture_views: Some(&mut self.texture_views),
+            });
+            timer.record_time("cmd");
+
+            for handle in self.texture_handles.values() {
+                state.renderer.mark_override_image_dirty(handle);
+            }
+
+            let base = state.compositor.base_view(render_surface.device(), size);
+            state
+                .renderer
+                .render_to_texture(
+                    render_surface.device(),
+                    render_surface.queue(),
+                    &self.scene,
+                    &base,
+                    &RenderParams {
+                        base_color: self.config.base_color,
+                        width: size.0,
+                        height: size.1,
+                        antialiasing_method: self.config.antialiasing_method,
+                    },
+                )
+                .expect("failed to render to texture");
+            timer.record_time("render");
+
+            // Empty the Vello scene (memory optimisation)
+            self.scene.reset();
+
+            // FTS: the page content lifted over layers, rasterised with it.
+            for layer in anyrender::composite::layers() {
+                let anyrender::composite::Layer::Overlay {
+                    id,
+                    rect,
+                    scene: Some(content),
+                } = layer
+                else {
+                    continue;
+                };
+                let origin = (rect.x0.floor(), rect.y0.floor());
+                let overlay_size = (
+                    (rect.x1 - origin.0).ceil() as u32,
+                    (rect.y1 - origin.1).ceil() as u32,
+                );
+                let view = state
+                    .compositor
+                    .overlay_view(render_surface.device(), id, overlay_size);
+                VelloScenePainter {
+                    inner: &mut self.scene,
+                    renderer: Some(&mut state.renderer),
+                    device_handle: Some(&render_surface.device_handle),
+                    texture_handles: Some(&mut self.texture_handles),
+                    texture_views: None,
+                }
+                .append_scene(
+                    (*content).clone(),
+                    kurbo::Affine::translate((-origin.0, -origin.1)),
+                );
+                state
+                    .renderer
+                    .render_to_texture(
+                        render_surface.device(),
+                        render_surface.queue(),
+                        &self.scene,
+                        &view,
+                        &RenderParams {
+                            base_color: Color::TRANSPARENT,
+                            width: overlay_size.0.max(1),
+                            height: overlay_size.1.max(1),
+                            antialiasing_method: self.config.antialiasing_method,
+                        },
+                    )
+                    .expect("failed to render an overlay");
+                self.scene.reset();
+            }
+        }
 
         let Ok(texture_view) = render_surface.target_texture_view() else {
             // Skip frame in case of error trying to get current surface texture
@@ -459,28 +619,16 @@ impl WindowRenderer for VelloWindowRenderer {
             self.scene.reset();
             return;
         };
-
-        for handle in self.texture_handles.values() {
-            state.renderer.mark_override_image_dirty(handle);
-        }
-
-        state
-            .renderer
-            .render_to_texture(
-                render_surface.device(),
-                render_surface.queue(),
-                &self.scene,
-                &texture_view,
-                &RenderParams {
-                    base_color: self.config.base_color,
-                    width: render_surface.config.width,
-                    height: render_surface.config.height,
-                    antialiasing_method: self.config.antialiasing_method,
-                },
-            )
-            .expect("failed to render to texture");
-        timer.record_time("render");
-
+        let layers = anyrender::composite::layers();
+        state.compositor.composite(
+            render_surface.device(),
+            render_surface.queue(),
+            &texture_view,
+            size,
+            &layers,
+            &self.texture_views,
+        );
+        timer.record_time("composite");
         drop(texture_view);
 
         if render_surface.maybe_blit_and_present().is_err() {
@@ -488,16 +636,46 @@ impl WindowRenderer for VelloWindowRenderer {
             return;
         }
         timer.record_time("present");
+        #[cfg(feature = "log_frame_times")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                println!(
+                    "vello: surface {:?} {}x{}, present {:?}, latency {}, blit {}",
+                    render_surface.config.format,
+                    render_surface.config.width,
+                    render_surface.config.height,
+                    render_surface.config.present_mode,
+                    render_surface.config.desired_maximum_frame_latency,
+                    // Always through the intermediate since the
+                    // compositor (the direct-surface path is gone).
+                    "yes",
+                );
+            }
+        }
 
-        render_surface
-            .device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
+        // FTS: poll, do not WAIT.
+        //
+        // This used to be `wait_indefinitely`, which blocks the thread
+        // until the GPU has finished everything it was given. That is a
+        // hard barrier between the CPU and the GPU once a frame: the
+        // CPU cannot start building frame N+1 until frame N has been
+        // rasterised, so the two never overlap and a frame costs
+        // CPU + GPU rather than max(CPU, GPU).
+        //
+        // `Poll` does the same housekeeping — running map callbacks and
+        // freeing what the queue has released — without the barrier.
+        // `FTS_GPU_BARRIER=1` puts the wait back, for the case where a
+        // driver needs it to stay honest.
+        let barrier = std::env::var_os("FTS_GPU_BARRIER").is_some();
+        let _ = render_surface.device().poll(if barrier {
+            wgpu::PollType::wait_indefinitely()
+        } else {
+            wgpu::PollType::Poll
+        });
 
         timer.record_time("wait");
         timer.print_times("vello: ");
-
-        // Empty the Vello scene (memory optimisation)
-        self.scene.reset();
     }
 }

@@ -56,6 +56,8 @@ mod null_backend;
 pub use null_backend::*;
 pub mod recording;
 pub use recording::Scene;
+/// FTS: layered compositing (a cached page with widget textures over it).
+pub mod composite;
 
 mod resource_id;
 pub use resource_id::ResourceId;

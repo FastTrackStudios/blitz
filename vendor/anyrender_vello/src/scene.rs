@@ -12,6 +12,8 @@ pub struct VelloScenePainter<'r, 's> {
     pub(crate) renderer: Option<&'r mut VelloRenderer>,
     pub(crate) device_handle: Option<&'r DeviceHandle>,
     pub(crate) texture_handles: Option<&'r mut FxHashMap<ResourceId, ImageData>>,
+    /// FTS: views of the same textures, for the compositor.
+    pub(crate) texture_views: Option<&'r mut FxHashMap<ResourceId, wgpu::TextureView>>,
     pub(crate) inner: &'s mut vello::Scene,
 }
 
@@ -25,6 +27,12 @@ impl RenderContext for VelloScenePainter<'_, '_> {
         {
             if let Ok(texture) = resource.downcast::<Texture>() {
                 let id = ResourceId::new();
+                if let Some(views) = &mut self.texture_views {
+                    views.insert(
+                        id,
+                        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    );
+                }
                 texture_handles.insert(id, renderer.register_texture(*texture));
                 Ok(id)
             } else {
@@ -42,6 +50,9 @@ impl RenderContext for VelloScenePainter<'_, '_> {
         {
             renderer.unregister_texture(handle);
         }
+        if let Some(views) = &mut self.texture_views {
+            views.remove(&resource_id);
+        }
     }
 
     fn renderer_specific_context(&self) -> Option<Box<dyn std::any::Any>> {
@@ -56,6 +67,7 @@ impl VelloScenePainter<'_, '_> {
             renderer: None,
             device_handle: None,
             texture_handles: None,
+            texture_views: None,
             inner: scene,
         }
     }
