@@ -488,6 +488,10 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
             && old.get_table() == new.get_table()
             && old.get_inherited_table() == new.get_inherited_table()
             && old.get_column() == new.get_column()
+            // A filter (outside the box struct) makes the element a
+            // containing block for fixed descendants: that moves them.
+            && stylo_taffy::convert::establishes_fixed_containing_block(old)
+                == stylo_taffy::convert::establishes_fixed_containing_block(new)
     };
 
     if box_tree_needs_rebuild() {

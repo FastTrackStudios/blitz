@@ -145,6 +145,16 @@ impl BaseDocument {
             }
             any_damage |= !damage.is_empty();
             needs_layout |= !(damage - paint_only).is_empty();
+            // An inline `<svg>` is drawn from a snapshot of its subtree taken
+            // at box construction (`currentColor` resolved), so any damage in
+            // one rebuilds its box (see `propagate_damage_flags`): lay out.
+            #[cfg(feature = "svg")]
+            {
+                needs_layout |= !damage.is_empty()
+                    && node
+                        .element_data()
+                        .is_some_and(|el| el.name.ns == markup5ever::ns!(svg));
+            }
         }
         self.resolve_damaged = !skip_allowed || any_damage;
         // FTS: a keyframe animation of `transform` restyles its node with no
@@ -162,14 +172,17 @@ impl BaseDocument {
             // A scroll moves no layout, but it moves what sticks.
             if !self.sticky_nodes.is_empty() {
                 self.apply_sticky(false);
-                self.nodes.bump_geometry_generation();
             }
+            // Geometry caches (hoisted offsets) are recomputed on next use
+            // after every resolve, laid out or not.
+            self.nodes.bump_geometry_generation();
         } else if skip_allowed && !needs_layout {
             self.propagate_damage_flags(root_node_id);
             timer.record_time("damage");
             self.flush_pending_style_images();
             self.resolve_transforms(root_node_id);
             self.apply_sticky(false);
+            self.nodes.bump_geometry_generation();
             timer.record_time("transform");
             self.build_paint_tree(root_node_id);
             timer.record_time("paint_tree");
