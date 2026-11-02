@@ -246,6 +246,12 @@ const SCROLL: &str = r#"<html><head><style>
 
 /// Scrolling changes `scroll_offset` without a `resolve()`; hit-testing must
 /// see the scrolled position of hoisted children immediately.
+///
+/// FTS divergence (036bf6747, "an overflow-clipping element roots its
+/// z-indexed descendants"): `#s` clips, so `#b` is hoisted into `#s`'s
+/// stacking context rather than the root's, and is clipped with it. Upstream
+/// expects the entry under the root; the hit-testing expectations are
+/// unchanged.
 #[test]
 fn scroll_moves_hoisted_box_without_resolve() {
     for incremental in [true, false] {
@@ -256,7 +262,8 @@ fn scroll_moves_hoisted_box_without_resolve() {
 
         // B is at y=100 inside a 50px scroller: not visible.
         assert_ne!(hit(&doc, 50.0, 20.0), b);
-        assert_eq!(hoisted_entry(&doc, root, b), Some((1, (0.0, 100.0))));
+        assert_eq!(hoisted_entry(&doc, root, b), None);
+        assert_eq!(hoisted_entry(&doc, s, b).map(|(z, _)| z), Some(1));
 
         let generation = doc.tree().geometry_generation();
         doc.scroll_node_by(s, 0.0, -90.0, |_| {});
@@ -265,7 +272,7 @@ fn scroll_moves_hoisted_box_without_resolve() {
 
         // No resolve: B now spans y=10..30 in the viewport.
         assert_eq!(hit(&doc, 50.0, 20.0), b, "incremental={incremental}");
-        assert_eq!(hoisted_entry(&doc, root, b), Some((1, (0.0, 10.0))));
+        assert_eq!(hoisted_entry(&doc, s, b).map(|(z, _)| z), Some(1));
 
         doc.resolve(0.0);
         assert_eq!(hit(&doc, 50.0, 20.0), b);
@@ -273,15 +280,17 @@ fn scroll_moves_hoisted_box_without_resolve() {
 }
 
 /// Hoisted offsets are computed at most once per geometry generation.
+///
+/// FTS divergence (036bf6747): `#s` clips, so it — not the root — holds
+/// `#b`'s stacking-context entry; the memoisation is checked there.
 #[test]
 fn hoisted_position_is_memoised_per_generation() {
     let mut doc = make_doc(SCROLL, true);
     let s = id(&doc, "#s");
     let b = id(&doc, "#b");
-    let root = doc.root_element().id;
 
     let entry = |doc: &HtmlDocument| {
-        doc.get_node(root)
+        doc.get_node(s)
             .unwrap()
             .stacking_context
             .as_ref()
