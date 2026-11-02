@@ -205,7 +205,11 @@ impl FromStr for DomEventKind {
             "keydown" => Ok(Self::KeyDown),
             "keyup" => Ok(Self::KeyUp),
             "input" => Ok(Self::Input),
-            "composition" => Ok(Self::Ime),
+            // FTS: a listener names the phase (`oncompositionupdate`, …);
+            // all of them are fed by the one IME event kind.
+            "composition" | "compositionstart" | "compositionupdate" | "compositionend" => {
+                Ok(Self::Ime)
+            }
 
             "focus" => Ok(Self::Focus),
             "blur" => Ok(Self::Blur),

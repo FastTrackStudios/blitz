@@ -773,12 +773,9 @@ impl Node {
         }
         self.mark_ancestors_dirty();
 
-        // If focussing a text input, enable IME and set IME area
-        if self
-            .element_data()
-            .and_then(|elem| elem.text_input_data())
-            .is_some()
-        {
+        // If focussing a text input (or an element that opted in to text
+        // input, see `takes_ime`), enable IME and set IME area
+        if self.takes_ime() {
             shell_provider.set_ime_enabled(true);
             let mut pos = self.absolute_position(0.0, 0.0);
             pos.x += self.final_layout().content_box_x();
@@ -797,13 +794,23 @@ impl Node {
         self.mark_ancestors_dirty();
 
         // If blurring a text input, disable IME
-        if self
-            .element_data()
-            .and_then(|elem| elem.text_input_data())
-            .is_some()
-        {
+        if self.takes_ime() {
             shell_provider.set_ime_enabled(false);
         }
+    }
+
+    /// Whether focusing this node turns the platform IME on: a form text
+    /// input, or (FTS) any element carrying an `inputmode` other than
+    /// `none`. A custom text editor (a focusable `<div>` that does its own
+    /// editing) declares itself with `inputmode="text"`, then receives the
+    /// IME's preedit and commit events like a text input does.
+    pub fn takes_ime(&self) -> bool {
+        self.element_data().is_some_and(|elem| {
+            elem.text_input_data().is_some()
+                || elem
+                    .attr(local_name!("inputmode"))
+                    .is_some_and(|mode| !mode.eq_ignore_ascii_case("none"))
+        })
     }
 
     pub fn is_focussed(&self) -> bool {
