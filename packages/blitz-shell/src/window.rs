@@ -1259,7 +1259,8 @@ struct Pacing {
     /// FTS: the screen's own frame (120 Hz on ProMotion, else 60): what a
     /// document animation — a scroll coasting, a transition — is drawn at.
     /// `min_frame` paces the clocks (meters, faces) that would otherwise
-    /// each repaint the window at every vsync.
+    /// each repaint the window at every vsync. Read only on iOS.
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     display_frame: Duration,
     last_frame: Instant,
     /// How long the last frame took to draw, start to end.
