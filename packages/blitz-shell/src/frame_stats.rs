@@ -33,7 +33,9 @@ static WHY_LAST: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU
 /// Why the next frame was asked for.
 #[derive(Clone, Copy)]
 pub(crate) enum Why {
-    /// The last paint changed which widgets are layers.
+    /// The last paint changed which widgets are layers (only with
+    /// `custom-widget`).
+    #[cfg_attr(not(feature = "custom-widget"), allow(dead_code))]
     Unsettled = 0,
     /// The document animates (a CSS animation or transition, a scroll).
     Animating = 1,
