@@ -187,10 +187,14 @@ impl BlitzDomNode {
         self.try_stylo_element_data()
             .as_ref()
             .and_then(|s| s.get())
-            .map(|s| {
-                s.styles.is_display_none()
-                    || s.styles.primary().clone_visibility()
-                        == visibility::computed_value::T::Hidden
+            .map(|s| match s.styles.get_primary() {
+                // Never styled: it was made under a `display: none` parent,
+                // which stylo does not style below (data, no primary style).
+                None => true,
+                Some(p) => {
+                    p.clone_display().is_none()
+                        || p.clone_visibility() == visibility::computed_value::T::Hidden
+                }
             })
             .unwrap_or(false)
     }
@@ -425,5 +429,62 @@ fn role_from_element_data(element_data: &ElementData) -> Option<Role> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Attribute, BaseDocument, DocumentConfig, qual_name};
+    use accesskit::NodeId;
+    use blitz_traits::shell::{ColorScheme, Viewport};
+
+    /// An element made under a `display: none` parent after the last
+    /// restyle has style data but no primary style (stylo does not style
+    /// below `display: none`). Building the tree asked it whether it was
+    /// hidden and unwrapped that style: any accessibility client (a screen
+    /// reader, an automation tool focusing the window) panicked the app in
+    /// stylo's `ElementStyles::primary`.
+    #[test]
+    fn a_tree_passes_elements_that_were_never_styled() {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let style = |value: &str| Attribute {
+            name: qual_name!("style"),
+            value: value.to_string(),
+        };
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![style("display:block")]);
+        let body = mutator.create_element(qual_name!("body"), vec![style("display:block")]);
+        let shown = mutator.create_element(qual_name!("div"), vec![style("display:block")]);
+        let hidden = mutator.create_element(qual_name!("div"), vec![style("display:none")]);
+        mutator.append_children(body, &[shown, hidden]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+        doc.resolve(0.0);
+
+        let mut mutator = doc.mutate();
+        let late = mutator.create_element(qual_name!("div"), vec![]);
+        mutator.append_children(hidden, &[late]);
+        drop(mutator);
+        doc.resolve(0.0);
+        let unstyled = doc.nodes[late]
+            .try_stylo_element_data()
+            .is_some_and(|d| d.has_data() && d.primary_styles().is_none());
+        assert!(
+            unstyled,
+            "the setup needs an element with data and no style"
+        );
+
+        let tree = doc.build_accessibility_tree();
+        let has = |id: crate::NodeId| tree.nodes.iter().any(|(n, _)| *n == NodeId(id.as_u64()));
+        assert!(has(shown), "a shown element is in the tree");
+        assert!(
+            !has(hidden) && !has(late),
+            "what is under display: none is not"
+        );
     }
 }
