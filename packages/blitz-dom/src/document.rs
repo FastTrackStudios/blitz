@@ -2431,7 +2431,7 @@ impl BaseDocument {
                 self.stylist.rebuild_initial_values_for_custom_properties();
             }
             if let Some(root) = self.try_root_element() {
-                style::invalidation::viewport_units::invalidate(root);
+                invalidate_viewport_units(root);
             }
         }
     }
@@ -3119,6 +3119,51 @@ impl AsMut<BaseDocument> for BaseDocument {
     fn as_mut(&mut self) -> &mut BaseDocument {
         self
     }
+}
+
+/// Marks for a re-cascade every element under `element` whose style used a
+/// viewport unit: stylo's `invalidation::viewport_units::invalidate`, but
+/// passing by an element that was never styled.
+///
+/// Blitz gives an element style data when it is made
+/// (`DocumentMutator::create_element`), before any restyle, and stylo never
+/// styles below `display: none`, so an element made under a hidden parent
+/// keeps data with no primary style. stylo's walk unwraps that style and
+/// panicked on the window's next resize. Such an element (and what is under
+/// it) resolved no viewport unit, and its first restyle styles it from
+/// scratch: there is nothing to invalidate.
+fn invalidate_viewport_units<E: style::dom::TElement>(element: E) -> bool {
+    use style::data::ViewportUnitUsage;
+    use style::dom::TNode;
+
+    let Some(mut data) = element.mutate_data() else {
+        return false;
+    };
+    if data.hint.will_recascade_subtree() || data.styles.get_primary().is_none() {
+        return false;
+    }
+
+    let usage = data.styles.viewport_unit_usage();
+    match usage {
+        ViewportUnitUsage::None => {}
+        ViewportUnitUsage::FromQuery => data.hint.insert(RestyleHint::RESTYLE_SELF),
+        ViewportUnitUsage::FromDeclaration => data.hint.insert(RestyleHint::RECASCADE_SELF),
+    }
+    drop(data);
+
+    let mut any_children_invalid = false;
+    for child in element.traversal_children() {
+        if let Some(child) = child.as_element() {
+            any_children_invalid |= invalidate_viewport_units(child);
+        }
+    }
+    if any_children_invalid {
+        // SAFETY: as in stylo's walk: the document is not being traversed
+        // (this runs from `set_stylist_device`, outside a restyle).
+        unsafe { element.set_dirty_descendants() };
+    }
+
+    usage != ViewportUnitUsage::None || any_children_invalid
 }
 
 #[cfg(test)]
@@ -3957,4 +4002,67 @@ pub struct CompositeState {
     pub visible: std::cell::RefCell<std::collections::HashSet<NodeId>>,
     /// The last paint changed `widgets`: paint once more.
     pub unsettled: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+mod viewport_unit_tests {
+    use super::*;
+    use crate::{Attribute, qual_name};
+    use blitz_traits::shell::ColorScheme;
+
+    /// A resize re-cascades what uses viewport units. An element that has
+    /// style data but was never styled (one made under a `display: none`
+    /// parent after the last restyle: stylo does not style below
+    /// `display: none`) has no primary style, and the walk must pass it by
+    /// rather than unwrap it — it panicked here, in stylo's
+    /// `ElementStyles::primary`, on the first resize of any window holding
+    /// such an element while something used `vw`.
+    #[test]
+    fn a_resize_passes_elements_that_were_never_styled() {
+        let viewport = |width| Viewport::new(width, 300, 1.0, ColorScheme::Light);
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(viewport(400)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let style = |value: &str| Attribute {
+            name: qual_name!("style"),
+            value: value.to_string(),
+        };
+
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![style("display:block")]);
+        let body = mutator.create_element(qual_name!("body"), vec![style("display:block;margin:0")]);
+        let wide = mutator.create_element(qual_name!("div"), vec![style("display:block;width:50vw;height:10px")]);
+        let hidden = mutator.create_element(qual_name!("div"), vec![style("display:none")]);
+        mutator.append_children(body, &[wide, hidden]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+        doc.resolve(0.0);
+        assert_eq!(
+            doc.nodes[wide].final_layout().size.width,
+            200.0,
+            "50vw of the first width"
+        );
+
+        // Made after the first restyle, under the hidden parent: never styled.
+        let mut mutator = doc.mutate();
+        let late = mutator.create_element(qual_name!("div"), vec![]);
+        mutator.append_children(hidden, &[late]);
+        drop(mutator);
+        doc.resolve(0.0);
+        let late_data = doc.nodes[late].try_stylo_element_data();
+        let unstyled = late_data.is_some_and(|d| d.has_data() && d.primary_styles().is_none());
+        assert!(unstyled, "the setup needs an element with data and no style");
+
+        doc.set_viewport(viewport(800));
+        doc.resolve(0.0);
+
+        assert_eq!(
+            doc.nodes[wide].final_layout().size.width,
+            400.0,
+            "50vw follows the new width"
+        );
+    }
 }
