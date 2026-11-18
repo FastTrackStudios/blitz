@@ -262,76 +262,91 @@ pub trait PaintScene: RenderContext {
 
     // --- Provided methods
 
-    /// Append a recorded Scene Fragment to the current scene
+    /// Append a recorded Scene Fragment to the current scene: its commands,
+    /// and its shared parts ([`Scene::append_shared`]) where they were
+    /// recorded, drawn from where they are.
     fn append_scene(&mut self, scene: Scene, scene_transform: Affine) {
-        for cmd in scene.commands {
-            match cmd {
-                RenderCommand::PushLayer(cmd) => self.push_layer(
-                    cmd.fill,
-                    cmd.blend,
-                    cmd.alpha,
-                    scene_transform * cmd.transform,
-                    &cmd.clip,
-                    cmd.filter,
-                    cmd.backdrop_filter,
-                ),
-                RenderCommand::PushClipLayer(cmd) => {
-                    self.push_clip_layer(cmd.fill, scene_transform * cmd.transform, &cmd.clip)
-                }
-                RenderCommand::PopLayer => self.pop_layer(),
-                RenderCommand::Stroke(cmd) => self.stroke(
-                    &cmd.style,
-                    scene_transform * cmd.transform,
-                    match cmd.brush {
-                        Paint::Solid(alpha_color) => Paint::Solid(alpha_color),
-                        Paint::Gradient(ref gradient) => Paint::Gradient(gradient),
-                        Paint::Image(ref image) => Paint::Image(image.as_ref()),
-                        Paint::Resource(id) => Paint::Resource(id),
-                        Paint::Custom(ref custom) => Paint::Custom(custom.as_ref()),
-                    },
-                    cmd.brush_transform,
-                    &cmd.shape,
-                ),
-                RenderCommand::Fill(cmd) => self.fill(
-                    cmd.fill,
-                    scene_transform * cmd.transform,
-                    match cmd.brush {
-                        Paint::Solid(alpha_color) => Paint::Solid(alpha_color),
-                        Paint::Gradient(ref gradient) => Paint::Gradient(gradient),
-                        Paint::Image(ref image) => Paint::Image(image.as_ref()),
-                        Paint::Resource(id) => Paint::Resource(id),
-                        Paint::Custom(ref custom) => Paint::Custom(custom.as_ref()),
-                    },
-                    cmd.brush_transform,
-                    &cmd.shape,
-                ),
-                RenderCommand::GlyphRun(cmd) => self.draw_glyphs(
-                    &cmd.font_data,
-                    cmd.font_size,
-                    cmd.hint,
-                    &cmd.normalized_coords,
-                    cmd.embolden,
-                    &cmd.style,
-                    match cmd.brush {
-                        Paint::Solid(alpha_color) => Paint::Solid(alpha_color),
-                        Paint::Gradient(ref gradient) => Paint::Gradient(gradient),
-                        Paint::Image(ref image) => Paint::Image(image.as_ref()),
-                        Paint::Resource(id) => Paint::Resource(id),
-                        Paint::Custom(ref custom) => Paint::Custom(custom.as_ref()),
-                    },
-                    cmd.brush_alpha,
-                    scene_transform * cmd.transform,
-                    cmd.glyph_transform,
-                    cmd.glyphs.into_iter(),
-                ),
-                RenderCommand::BoxShadow(cmd) => self.draw_box_shadow(
-                    scene_transform * cmd.transform,
-                    cmd.rect,
-                    cmd.brush,
-                    cmd.radius,
-                    cmd.std_dev,
-                ),
+        let mut shared = scene.shared.iter().peekable();
+        for (i, cmd) in scene.commands.iter().enumerate() {
+            while let Some(part) = shared.next_if(|p| p.at <= i) {
+                self.append_shared(&part.commands, scene_transform * part.transform);
             }
+            self.replay_command(cmd, scene_transform);
+        }
+        for part in shared {
+            self.append_shared(&part.commands, scene_transform * part.transform);
+        }
+    }
+
+    /// Draw recorded `commands` at `transform`, from where they are: kept
+    /// and shared (a retained layer drawn every frame), never copied. A
+    /// painter that encodes or rasterises (Vello) draws them straight from
+    /// the borrowed commands; a recording ([`Scene`]) keeps a share of them.
+    fn append_shared(&mut self, commands: &Arc<Vec<RenderCommand>>, transform: Affine) {
+        for cmd in commands.iter() {
+            self.replay_command(cmd, transform);
+        }
+    }
+
+    /// Draw one recorded command at `transform`, from where it is.
+    fn replay_command(&mut self, cmd: &RenderCommand, transform: Affine) {
+        fn paint(brush: &Paint) -> PaintRef<'_> {
+            match brush {
+                Paint::Solid(alpha_color) => Paint::Solid(*alpha_color),
+                Paint::Gradient(gradient) => Paint::Gradient(gradient),
+                Paint::Image(image) => Paint::Image(image.as_ref()),
+                Paint::Resource(id) => Paint::Resource(*id),
+                Paint::Custom(custom) => Paint::Custom(custom.as_ref()),
+            }
+        }
+        match cmd {
+            RenderCommand::PushLayer(cmd) => self.push_layer(
+                cmd.fill,
+                cmd.blend,
+                cmd.alpha,
+                transform * cmd.transform,
+                &cmd.clip,
+                cmd.filter.clone(),
+                cmd.backdrop_filter.clone(),
+            ),
+            RenderCommand::PushClipLayer(cmd) => {
+                self.push_clip_layer(cmd.fill, transform * cmd.transform, &cmd.clip)
+            }
+            RenderCommand::PopLayer => self.pop_layer(),
+            RenderCommand::Stroke(cmd) => self.stroke(
+                &cmd.style,
+                transform * cmd.transform,
+                paint(&cmd.brush),
+                cmd.brush_transform,
+                &cmd.shape,
+            ),
+            RenderCommand::Fill(cmd) => self.fill(
+                cmd.fill,
+                transform * cmd.transform,
+                paint(&cmd.brush),
+                cmd.brush_transform,
+                &cmd.shape,
+            ),
+            RenderCommand::GlyphRun(cmd) => self.draw_glyphs(
+                &cmd.font_data,
+                cmd.font_size,
+                cmd.hint,
+                &cmd.normalized_coords,
+                cmd.embolden,
+                &cmd.style,
+                paint(&cmd.brush),
+                cmd.brush_alpha,
+                transform * cmd.transform,
+                cmd.glyph_transform,
+                cmd.glyphs.iter().copied(),
+            ),
+            RenderCommand::BoxShadow(cmd) => self.draw_box_shadow(
+                transform * cmd.transform,
+                cmd.rect,
+                cmd.brush,
+                cmd.radius,
+                cmd.std_dev,
+            ),
         }
     }
 
