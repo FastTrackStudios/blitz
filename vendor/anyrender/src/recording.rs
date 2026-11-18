@@ -138,6 +138,21 @@ pub struct BoxShadowCommand {
 pub struct Scene {
     pub tolerance: f64,
     pub commands: Vec<RenderCommand>,
+    /// Recorded commands kept by reference ([`PaintScene::append_shared`]),
+    /// each drawn before `commands[at]` (after the last command when `at`
+    /// is past them), in order. A painter draws them where they are
+    /// ([`PaintScene::append_scene`]); [`Scene::flattened`] lists them
+    /// among the commands, copied.
+    pub shared: Vec<SharedAt>,
+}
+
+/// Recorded commands drawn by reference at a place in a [`Scene`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedAt {
+    /// The index in [`Scene::commands`] it is drawn before.
+    pub at: usize,
+    pub commands: Arc<Vec<RenderCommand>>,
+    pub transform: Affine,
 }
 
 impl Default for Scene {
@@ -145,6 +160,7 @@ impl Default for Scene {
         Self {
             tolerance: DEFAULT_TOLERANCE,
             commands: Vec::new(),
+            shared: Vec::new(),
         }
     }
 }
@@ -159,7 +175,34 @@ impl Scene {
         Self {
             tolerance,
             commands: Vec::new(),
+            shared: Vec::new(),
         }
+    }
+
+    /// Every command it draws, in order, its shared parts copied in at
+    /// their transforms: for a reader of the commands (a test, an
+    /// encoder). A painter needs no copy ([`PaintScene::append_scene`]).
+    pub fn flattened(&self) -> Vec<RenderCommand> {
+        let mut out = Vec::with_capacity(self.commands.len());
+        let mut shared = self.shared.iter().peekable();
+        let put = |out: &mut Vec<RenderCommand>, part: &SharedAt| {
+            out.extend(
+                part.commands
+                    .iter()
+                    .cloned()
+                    .map(|cmd| cmd.apply_transform(part.transform)),
+            );
+        };
+        for (i, cmd) in self.commands.iter().enumerate() {
+            while let Some(part) = shared.next_if(|p| p.at <= i) {
+                put(&mut out, part);
+            }
+            out.push(cmd.clone());
+        }
+        for part in shared {
+            put(&mut out, part);
+        }
+        out
     }
 
     fn convert_paint(&mut self, paint_ref: PaintRef<'_>) -> Paint {
@@ -177,6 +220,7 @@ impl Scene {
 impl RenderContext for Scene {}
 impl PaintScene for Scene {
     fn reset(&mut self) {
+        self.shared.clear();
         self.commands.clear()
     }
 
@@ -308,12 +352,28 @@ impl PaintScene for Scene {
     }
 
     fn append_scene(&mut self, scene: Scene, scene_transform: Affine) {
+        // Its shared parts stay shared, at their places among the
+        // commands appended after this scene's own.
+        let base = self.commands.len();
+        self.shared.extend(scene.shared.into_iter().map(|part| SharedAt {
+            at: base + part.at,
+            commands: part.commands,
+            transform: scene_transform * part.transform,
+        }));
         self.commands.extend(
             scene
                 .commands
                 .into_iter()
                 .map(|cmd| cmd.apply_transform(scene_transform)),
         );
+    }
+
+    fn append_shared(&mut self, commands: &Arc<Vec<RenderCommand>>, transform: Affine) {
+        self.shared.push(SharedAt {
+            at: self.commands.len(),
+            commands: Arc::clone(commands),
+            transform,
+        });
     }
 }
 
@@ -338,5 +398,143 @@ mod svg_path {
     {
         let s = String::deserialize(deserializer)?;
         svg_path_parser::parse_svg_path(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+
+    fn square(x: f64) -> Scene {
+        let mut s = Scene::new();
+        s.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::BLACK,
+            None,
+            &Rect::new(x, 0.0, x + 1.0, 1.0),
+        );
+        s
+    }
+
+    fn xs(commands: &[RenderCommand]) -> Vec<f64> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::Fill(f) => Some(f.transform.translation().x + f.shape.bounding_box().x0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_recording_keeps_shared_commands_by_reference_at_their_place() {
+        let layer = Arc::new(square(10.0).commands);
+        let mut widget = square(0.0);
+        widget.append_shared(&layer, Affine::translate((5.0, 0.0)));
+        widget.append_scene(square(1.0), Affine::IDENTITY);
+        assert!(Arc::ptr_eq(&widget.shared[0].commands, &layer), "copied, not shared");
+        assert_eq!(widget.commands.len(), 2);
+        assert_eq!(xs(&widget.flattened()), vec![0.0, 15.0, 1.0]);
+
+        // Appended into another recording, still shared, still in place.
+        let mut page = square(-1.0);
+        page.append_scene(widget, Affine::translate((100.0, 0.0)));
+        assert!(Arc::ptr_eq(&page.shared[0].commands, &layer));
+        assert_eq!(xs(&page.flattened()), vec![-1.0, 100.0, 115.0, 101.0]);
+
+        // Drawn into a painter, in the same order.
+        assert!(page.shared.iter().all(|part| part.at == 2));
+        let mut painter = Flat(Scene::new());
+        painter.append_scene(page, Affine::IDENTITY);
+        assert_eq!(xs(&painter.0.commands), vec![-1.0, 100.0, 115.0, 101.0]);
+    }
+
+    /// A painter with no recording of its own: what Vello's does, drawing
+    /// every command it is given as it comes.
+    struct Flat(Scene);
+
+    impl RenderContext for Flat {}
+
+    impl PaintScene for Flat {
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn push_layer(
+            &mut self,
+            fill: Fill,
+            blend: impl Into<BlendMode>,
+            alpha: f32,
+            transform: Affine,
+            clip: &impl Shape,
+            filter: Option<Arc<Filter>>,
+            backdrop_filter: Option<Arc<Filter>>,
+        ) {
+            self.0.push_layer(fill, blend, alpha, transform, clip, filter, backdrop_filter);
+        }
+        fn push_clip_layer(&mut self, fill: Fill, transform: Affine, clip: &impl Shape) {
+            self.0.push_clip_layer(fill, transform, clip);
+        }
+        fn pop_layer(&mut self) {
+            self.0.pop_layer();
+        }
+        fn stroke<'a>(
+            &mut self,
+            style: &Stroke,
+            transform: Affine,
+            brush: impl Into<PaintRef<'a>>,
+            brush_transform: Option<Affine>,
+            shape: &impl Shape,
+        ) {
+            self.0.stroke(style, transform, brush, brush_transform, shape);
+        }
+        fn fill<'a>(
+            &mut self,
+            style: Fill,
+            transform: Affine,
+            brush: impl Into<PaintRef<'a>>,
+            brush_transform: Option<Affine>,
+            shape: &impl Shape,
+        ) {
+            self.0.fill(style, transform, brush, brush_transform, shape);
+        }
+        fn draw_glyphs<'a, 's: 'a>(
+            &'s mut self,
+            font: &'a FontData,
+            font_size: f32,
+            hint: bool,
+            normalized_coords: &'a [NormalizedCoord],
+            embolden: kurbo::Vec2,
+            style: impl Into<StyleRef<'a>>,
+            brush: impl Into<PaintRef<'a>>,
+            brush_alpha: f32,
+            transform: Affine,
+            glyph_transform: Option<Affine>,
+            glyphs: impl Iterator<Item = Glyph> + Clone,
+        ) {
+            self.0.draw_glyphs(
+                font,
+                font_size,
+                hint,
+                normalized_coords,
+                embolden,
+                style,
+                brush,
+                brush_alpha,
+                transform,
+                glyph_transform,
+                glyphs,
+            );
+        }
+        fn draw_box_shadow(
+            &mut self,
+            transform: Affine,
+            rect: Rect,
+            brush: Color,
+            radius: f64,
+            std_dev: f64,
+        ) {
+            self.0.draw_box_shadow(transform, rect, brush, radius, std_dev);
+        }
     }
 }
